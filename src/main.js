@@ -11,6 +11,7 @@
     'bubbles',
     'latex',
     'fold',
+    'pasteScroll',
     'tweaks',
     'context',
     'nav',

@@ -86,6 +86,8 @@ var I18N = {
     '便捷功能': 'Shortcuts',
     '消息上下导航按钮': 'Message navigation buttons',
     '一键全屏按钮': 'Fullscreen button',
+    '粘贴后输入框滚动到光标': 'Scroll input to caret after paste',
+    '长文粘贴/拖放后自动定位到光标所在位置': 'Jump the input box to the caret after pasting or dropping long text',
     '语言': 'Language',
     '自动': 'Auto',
     '中文': '中文',

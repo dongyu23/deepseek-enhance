@@ -91,6 +91,7 @@ var Panel = {
         '<div class="dse-p-sec">' + T('便捷功能') + '</div>' +
         this.sw('navButtons', T('消息上下导航按钮')) +
         this.sw('fullscreenBtn', T('一键全屏按钮')) +
+        this.sw('pasteScroll', T('粘贴后输入框滚动到光标'), T('长文粘贴/拖放后自动定位到光标所在位置')) +
         '<div class="dse-p-sec">' + T('语言') + '</div>' +
         '<div class="dse-seg" data-seg="lang">' +
           '<button data-v="auto">' + T('自动') + '</button><button data-v="zh">中文</button><button data-v="en">English</button></div>' +

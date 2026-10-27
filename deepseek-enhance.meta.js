@@ -2,10 +2,10 @@
 // @name         DeepSeek Enhance 深度增强
 // @name:en      DeepSeek Enhance
 // @namespace    https://github.com/Hiweny/deepseek-enhance
-// @version      8.5.0
-// @description  气泡材质(默认iOS磨砂)/思考自动折叠/代码块自动折叠/中英文界面/Markdown本地美化/图片URL背景/顶栏背景透出/按会话隔离的系统提示词/防撤回(连续撤回回填·重载对账)/上下文用量(1M·阈值提醒)/消息导航(虚拟列表适配)/输入框磨砂/移动端适配
-// @updateURL    https://raw.githubusercontent.com/Hiweny/deepseek-enhance/main/deepseek-enhance.meta.js
-// @downloadURL  https://raw.githubusercontent.com/Hiweny/deepseek-enhance/main/deepseek-enhance.user.js
+// @version      8.6.0
+// @description  气泡材质(默认iOS磨砂)/思考自动折叠/代码块自动折叠/粘贴后输入框滚动到光标/中英文界面/Markdown本地美化/图片URL背景/顶栏背景透出/按会话隔离的系统提示词/防撤回(连续撤回回填·重载对账)/上下文用量(1M·阈值提醒)/消息导航(虚拟列表适配)/输入框磨砂/移动端适配
+// @updateURL    https://raw.githubusercontent.com/dongyu23/deepseek-enhance/main/deepseek-enhance.meta.js
+// @downloadURL  https://raw.githubusercontent.com/dongyu23/deepseek-enhance/main/deepseek-enhance.user.js
 // @author       Hiweny
 // @license      MIT
 // @match        https://chat.deepseek.com/*
@@ -16,6 +16,6 @@
 // @grant        GM_deleteValue
 // @grant        GM_listValues
 // @grant        GM_addStyle
-// @supportURL   https://github.com/Hiweny/deepseek-enhance/issues
+// @supportURL   https://github.com/dongyu23/deepseek-enhance/issues
 // @homepageURL  https://github.com/Hiweny/deepseek-enhance
 // ==/UserScript==

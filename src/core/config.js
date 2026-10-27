@@ -28,6 +28,7 @@ var DEFAULT_CONFIG = {
   markdownPretty: true,                  // 仅本地美化官网 markdown 渲染，不向 AI 发任何指令
   latexRender: true,                     // KaTeX 公式渲染（官网默认不渲染 \( \)/\[ \]/$...$）
   timeInject: false,                     // 时间注入
+  pasteScroll: true,                     // 粘贴/拖放后输入框自动滚动到光标处
   ctxWarnPct: 80,                        // 上下文用量提醒阈值（百分比，达阈值弹提示）
 
   // 单会话系统提示词（独立开关，按会话隔离）

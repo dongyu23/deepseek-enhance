@@ -2,13 +2,15 @@
 
 面向 [chat.deepseek.com](https://chat.deepseek.com/) 的油猴增强脚本：界面美化、水玻璃气泡、防撤回、按会话隔离的系统提示词、思考自动折叠、上下文用量等。手机浏览器（Kiwi / Edge / Safari 油猴扩展）与桌面端均适配，明暗双色自适应。
 
+> 本仓库是 [Hiweny/deepseek-enhance](https://github.com/Hiweny/deepseek-enhance) 的 fork，新增「粘贴后输入框滚动到光标」等自定义功能。
+
 ## 安装
 
 先安装 Tampermonkey（或兼容用户脚本管理器），再点击安装：
 
-**[deepseek-enhance.user.js](https://raw.githubusercontent.com/Hiweny/deepseek-enhance/main/deepseek-enhance.user.js)**
+**[deepseek-enhance.user.js](https://raw.githubusercontent.com/dongyu23/deepseek-enhance/main/deepseek-enhance.user.js)**
 
-更新检查 meta：[deepseek-enhance.meta.js](https://raw.githubusercontent.com/Hiweny/deepseek-enhance/main/deepseek-enhance.meta.js)
+更新检查 meta：[deepseek-enhance.meta.js](https://raw.githubusercontent.com/dongyu23/deepseek-enhance/main/deepseek-enhance.meta.js)
 
 设置入口在输入框工具条上（「深度思考 / 智能搜索」旁边的齿轮），位置与官网原生按钮一致，不新增悬浮入口。
 
@@ -44,6 +46,7 @@
 - 本地历史按会话隔离，可在面板清除。
 
 ### 其他
+- **粘贴后输入框滚动到光标（fork 新增）**：输入框增高到上限后转为内部滚动，粘贴/拖放长文后视口停在顶部、光标（粘贴落点）在视野外。本功能用镜像 div 复刻输入框排版测算光标像素位置，仅当光标超出可视区时自动滚到光标附近，无内部滚动的小粘贴零感知。可在「其他 → 便捷功能」开关。
 - 时间注入开关、页面缩放；设置面板四页签（外观 / 对话 / 提示词 / 其他），移动端底部弹层不溢出、适配深色。
 
 ## 项目结构
