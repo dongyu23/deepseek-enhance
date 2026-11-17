@@ -56,6 +56,10 @@ var I18N = {
     '离线 KaTeX，渲染 \\( \\)、\\[ \\]、$ 公式': 'Offline KaTeX for \\( \\), \\[ \\], $ formulas',
     '隐式时间注入': 'Implicit time injection',
     // ---------- chat-demo 模型切换 ----------
+    'API 端点': 'API endpoint',
+    'API Key': 'API key',
+    '（用页面里填的官方 Key）': '(use the official key entered on the page)',
+    '留空 = 用官方设置里填的 Key；填写则替换请求头 x-api-key': 'Leave empty to use the key entered in the official settings; a value here replaces the x-api-key request header',
     '模型': 'Model',
     'deepseek-flash（官方默认）': 'deepseek-flash (official default)',
     '留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段，端点 / Key / 工具一律不变': 'Leave empty for the official default (deepseek-flash). Only the model field in the request is swapped; endpoint, key and tools stay untouched',

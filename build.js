@@ -19,7 +19,7 @@ const ORDER = [
   ['modules/context.js'], ['modules/nav.js'], ['modules/zoom.js'],
   ['modules/fold.js'],
   ['modules/buttons.js'],
-  ['modules/demomodel.js'],
+  ['modules/demoapi.js'],
   ['settings/panel.js'],
   ['main.js'], ['footer.js']
 ].map((x) => x[0]);

@@ -2,7 +2,7 @@
 // @name         DeepSeek Enhance 深度增强
 // @name:en      DeepSeek Enhance
 // @namespace    https://github.com/Hiweny/deepseek-enhance
-// @version      8.7.16
+// @version      8.7.17
 // @description  气泡材质(默认iOS磨砂)/思考自动折叠/代码块自动折叠/中英文界面/Markdown本地美化/LaTeX/图片URL背景/顶栏背景透出/按会话隔离的系统提示词(新对话可先填后发)/防撤回/上下文用量/消息导航(虚拟列表适配)/输入框磨砂/移动端适配
 // @updateURL    https://raw.githubusercontent.com/dongyu23/deepseek-enhance/main/deepseek-enhance.meta.js
 // @downloadURL  https://raw.githubusercontent.com/dongyu23/deepseek-enhance/main/deepseek-enhance.user.js
@@ -106,7 +106,7 @@ var Bridge = {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DSE = window.DSE = {
-  version: '8.7.16',
+  version: '8.7.17',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   bridge: Bridge,
   modules: {},
@@ -156,7 +156,9 @@ var DEFAULT_CONFIG = {
   latexRender: true,                     // KaTeX 公式渲染（官网默认不渲染 \( \)/\[ \]/$...$）
   timeInject: false,                     // 时间注入
   ctxWarnPct: 80,                        // 上下文用量提醒阈值（百分比，达阈值弹提示）
-  demoModel: '',                         // chat-demo 页模型覆盖（空=用官方默认 deepseek-flash；只换 model 字段，其余原样）
+  demoEndpoint: '',                      // chat-demo 页 API 端点覆盖（空=官方 api.deepseek.com/anthropic/v1；不含 /messages）
+  demoKey: '',                           // chat-demo 页 API Key 覆盖（空=用页面里填的官方 Key）
+  demoModel: '',                         // chat-demo 页模型覆盖（空=用官方默认 deepseek-flash）
 
   // 单会话系统提示词（独立开关，按会话隔离）
   systemPromptEnabled: false,
@@ -457,6 +459,10 @@ var I18N = {
     '离线 KaTeX，渲染 \\( \\)、\\[ \\]、$ 公式': 'Offline KaTeX for \\( \\), \\[ \\], $ formulas',
     '隐式时间注入': 'Implicit time injection',
     // ---------- chat-demo 模型切换 ----------
+    'API 端点': 'API endpoint',
+    'API Key': 'API key',
+    '（用页面里填的官方 Key）': '(use the official key entered on the page)',
+    '留空 = 用官方设置里填的 Key；填写则替换请求头 x-api-key': 'Leave empty to use the key entered in the official settings; a value here replaces the x-api-key request header',
     '模型': 'Model',
     'deepseek-flash（官方默认）': 'deepseek-flash (official default)',
     '留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段，端点 / Key / 工具一律不变': 'Leave empty for the official default (deepseek-flash). Only the model field in the request is swapped; endpoint, key and tools stay untouched',
@@ -2408,38 +2414,45 @@ var Buttons = {
 };
 DSE.modules.buttons = Buttons;
 
-/* ===== modules/demomodel.js ===== */
+/* ===== modules/demoapi.js ===== */
 /* ============================================================
- * modules/demomodel：chat-demo 页模型切换（最小实现：只换 model 字段）
+ * modules/demoapi：chat-demo 页 API 覆盖（端点 / Key / 模型，三项各自独立）
  *
- * 背景：官方 API demo（cdn.deepseek.com/chat-demo）把模型写死为
- * deepseek-flash，界面没有模型选择器。用户需要在官方壳子里换模型
- * （deepseek-chat / deepseek-reasoner / 未来的新模型）。
+ * 背景：官方 API demo（cdn.deepseek.com/chat-demo）把端点与模型写死
+ * （api.deepseek.com/anthropic/v1 + deepseek-flash），Key 存在页面
+ * localStorage。用户需要换模型、以及换模型提供方的端点。
  *
- * 本模块只做一件事：拦截发往 /anthropic/v1/messages 的请求，把 body
- * 里的 model 换成配置值。**其余一律原样**——端点、x-api-key、
- * deepseek_* 服务端工具（联网搜索/读链接）、系统提示、thinking /
- * safety_check / title 等私有字段全都不碰。配置为空时完全不动。
- *
- * 配置入口：注入到官方设置弹窗（通用设置 tab）末尾的“模型”行，
- * 只追加 DOM、不改动弹窗原有节点；样式按注入时刻的现有设置行计算值
- * 镜像（跟随明暗主题）。
+ * 做法：拦截发往 /anthropic/v1/messages 的请求，按配置改写三项，
+ * **彼此独立、留空即不干预**：
+ *   - demoEndpoint：替换请求 URL 的 base（官方默认
+ *     https://api.deepseek.com/anthropic/v1；填到不含 /messages 为止）
+ *   - demoKey：替换 x-api-key 请求头（空 = 用页面里填的官方 Key）
+ *   - demoModel：替换 body.model（空 = 官方默认 deepseek-flash）
+ * **请求体其余部分一律原样**——deepseek_* 服务端工具（联网搜索/读链接）、
+ * 系统提示、thinking / safety_check / title 等私有字段全都不碰。
  *
  * 协议实测（2026-11-17，bundle 分析）：demo 用 Anthropic Messages API，
- * POST {api.deepseek.com}/anthropic/v1/messages，头 x-api-key，SSE 流式。
- * 该 URL 模式只存在于 demo 页，主站（/api/v0/chat/completion）不受影响。
+ * POST {base}/messages，头 x-api-key，SSE 流式。该 URL 模式只存在于
+ * demo 页，主站（/api/v0/chat/completion）不受影响。
+ *
+ * 端点兼容性（如实说明）：
+ *   - 换成 DeepSeek 的中转/镜像（同协议）→ 全部照旧，工具也照样工作；
+ *   - 换成别家提供方 → 请求原样直达，deepseek_* 工具类型对方不认
+ *     （报错或被忽略），且对方必须说 Anthropic 协议；OpenAI 协议的
+ *     端点需要额外的协议翻译层（未做）。
+ *   - 模型与工具在当前实现里是同一个请求发出的（服务端工具），详见
+ *     代码注释与交付说明——解耦需要客户端 agent 桥接，未做。
  * ============================================================ */
-var DemoModel = {
-  KEY: 'demoModel',
-  // 仅作输入建议（datalist），不限制手输；官方默认值写死在 bundle 里
+var DemoApi = {
+  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel' },
+  DEFAULT_BASE: 'https://api.deepseek.com/anthropic/v1',
+  // 模型输入建议（datalist），不限制手输
   HINTS: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-flash'],
 
-  // 当前配置的模型（空 = 不干预，用官方默认）
-  model: function () {
-    return (DSE.config.get(this.KEY) || '').trim();
-  },
+  cfg: function (k) { return (DSE.config.get(this.KEYS[k]) || '').trim(); },
+  base: function () { return this.cfg('endpoint').replace(/\/+$/, ''); },
 
-  /* ---------- 请求改写：只换 model 字段 ---------- */
+  /* ---------- 请求改写：端点 / Key / 模型 ---------- */
   patchFetch: function () {
     var self = this;
     if (!window.fetch) return;
@@ -2447,31 +2460,39 @@ var DemoModel = {
     window.fetch = function (input, init) {
       try {
         var url = typeof input === 'string' ? input : (input && input.url) || '';
-        var model = self.model();
-        if (model && url.indexOf('/anthropic/v1/messages') !== -1 &&
-            init && typeof init.body === 'string') {
-          var body = JSON.parse(init.body);
-          if (body && body.model !== model) {
-            body.model = model;
-            var next = {};
-            for (var k in init) if (Object.prototype.hasOwnProperty.call(init, k)) next[k] = init[k];
-            next.body = JSON.stringify(body);
-            init = next;
+        if (url.indexOf('/anthropic/v1/messages') !== -1) {
+          var base = self.base(), key = self.cfg('key'), model = self.cfg('model');
+          // 1) 端点：替换 base（已带 /messages 则原样用）
+          if (base) url = /\/messages$/.test(base) ? base : base + '/messages';
+          // 2) 请求头：x-api-key
+          if (key && init && init.headers) {
+            var h = {};
+            for (var k in init.headers) if (Object.prototype.hasOwnProperty.call(init.headers, k)) h[k] = init.headers[k];
+            h['x-api-key'] = key;
+            init = Object.assign({}, init, { headers: h });
+          }
+          // 3) body.model（其余字段原样，含 tools 数组）
+          if (model && init && typeof init.body === 'string') {
+            var body = JSON.parse(init.body);
+            if (body && body.model !== model) {
+              body.model = model;
+              init = Object.assign({}, init, { body: JSON.stringify(body) });
+            }
           }
         }
       } catch (e) {}
-      return orig.call(this, input, init);
+      return orig.call(this, url, init);
     };
   },
 
-  /* ---------- UI：注入官方设置弹窗的“模型”行 ---------- */
+  /* ---------- UI：注入官方设置弹窗（通用设置 tab 末尾） ---------- */
   injectUI: function () {
     var dlg = document.querySelector('[class*="dialogMain-"]');
     if (!dlg) return;
     var refRow = dlg.querySelector('[class*="cell-"][class*="row-"]');
     if (!refRow || !refRow.parentElement) return;
     var content = refRow.parentElement;
-    if (content.querySelector('[data-dse-model-row]')) return;
+    if (content.querySelector('[data-dse-api-row]')) return;
     var pick = function (el, props) {
       var cs = getComputedStyle(el), o = {};
       props.forEach(function (p) { o[p] = cs[p]; });
@@ -2479,52 +2500,58 @@ var DemoModel = {
     };
     var refLabel = refRow.querySelector('[class*="label-"]') || refRow;
     var refCtrl = refRow.querySelector('button') || refRow;
-    var rowCss = pick(refRow, ['color', 'fontSize']);
     var labelCss = pick(refLabel, ['color', 'fontSize']);
     var ctrlCss = pick(refCtrl, ['backgroundColor', 'color']);
-
-    var row = document.createElement('div');
-    row.setAttribute('data-dse-model-row', '1');
-    row.style.cssText = 'display:flex;align-items:center;gap:8px;min-height:60px;padding:12px 0;' +
-      'font-size:' + (rowCss.fontSize || '14px') + ';color:' + (rowCss.color || 'inherit');
-
-    var label = document.createElement('div');
-    label.textContent = DSE.t('模型');
-    label.style.cssText = 'flex:1;font-size:' + (labelCss.fontSize || '14px') + ';color:' + (labelCss.color || 'inherit');
-
-    var input = document.createElement('input');
-    input.type = 'text';
-    input.setAttribute('data-dse-model-input', '1');
-    input.setAttribute('list', 'dse-model-hints');
-    input.placeholder = DSE.t('deepseek-flash（官方默认）');
-    input.value = this.model();
-    input.title = DSE.t('留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段，端点 / Key / 工具一律不变');
-    input.style.cssText = 'width:200px;height:36px;border:none;outline:none;border-radius:18px;' +
-      'padding:0 14px;font-size:14px;background:' + (ctrlCss.backgroundColor || 'rgba(127,127,127,.18)') + ';' +
+    var ctrlStyle = 'width:260px;height:36px;border:none;outline:none;border-radius:18px;padding:0 14px;' +
+      'font-size:14px;background:' + (ctrlCss.backgroundColor || 'rgba(127,127,127,.18)') + ';' +
       'color:' + (ctrlCss.color || 'inherit');
-    input.addEventListener('input', function () {
-      clearTimeout(input._dseT);
-      var v = input.value.trim();
-      input._dseT = setTimeout(function () { DSE.config.set(DemoModel.KEY, v); }, 300);
-    });
-    // 失焦即落库，避免只改不看
-    input.addEventListener('blur', function () {
-      clearTimeout(input._dseT);
-      DSE.config.set(DemoModel.KEY, input.value.trim());
-    });
 
-    var dl = document.createElement('datalist');
-    dl.id = 'dse-model-hints';
-    this.HINTS.forEach(function (m) {
-      var o = document.createElement('option');
-      o.value = m;
-      dl.appendChild(o);
-    });
+    var self = this;
+    var mkRow = function (labelText, cfgKey, placeholder, title, isPassword) {
+      var row = document.createElement('div');
+      row.setAttribute('data-dse-api-row', cfgKey);
+      row.style.cssText = 'display:flex;align-items:center;gap:8px;min-height:60px;padding:12px 0;font-size:14px';
+      var label = document.createElement('div');
+      label.textContent = DSE.t(labelText);
+      label.style.cssText = 'flex:1;font-size:' + (labelCss.fontSize || '14px') + ';color:' + (labelCss.color || 'inherit');
+      var input = document.createElement('input');
+      input.type = isPassword ? 'password' : 'text';
+      if (cfgKey === 'model') input.setAttribute('list', 'dse-model-hints');
+      input.placeholder = placeholder;
+      input.value = self.cfg(cfgKey);
+      input.title = title;
+      input.style.cssText = ctrlStyle;
+      input.addEventListener('input', function () {
+        clearTimeout(input._dseT);
+        var v = input.value.trim();
+        input._dseT = setTimeout(function () { DSE.config.set(self.KEYS[cfgKey], v); }, 300);
+      });
+      input.addEventListener('blur', function () {
+        clearTimeout(input._dseT);
+        DSE.config.set(self.KEYS[cfgKey], input.value.trim());
+      });
+      row.appendChild(label);
+      row.appendChild(input);
+      return row;
+    };
 
-    row.appendChild(label);
-    row.appendChild(input);
-    content.appendChild(row);
-    if (!document.getElementById('dse-model-hints')) document.body.appendChild(dl);
+    content.appendChild(mkRow('API 端点', 'endpoint', DemoApi.DEFAULT_BASE,
+      DSE.t('留空 = 官方 ' + DemoApi.DEFAULT_BASE + '。填模型提供方的 Anthropic 协议 base（不含 /messages）。注意：换走后 deepseek_* 工具对方不认')));
+    content.appendChild(mkRow('API Key', 'key', DSE.t('（用页面里填的官方 Key）'),
+      DSE.t('留空 = 用官方设置里填的 Key；填写则替换请求头 x-api-key'), true));
+    content.appendChild(mkRow('模型', 'model', DSE.t('deepseek-flash（官方默认）'),
+      DSE.t('留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段')));
+
+    if (!document.getElementById('dse-model-hints')) {
+      var dl = document.createElement('datalist');
+      dl.id = 'dse-model-hints';
+      this.HINTS.forEach(function (m) {
+        var o = document.createElement('option');
+        o.value = m;
+        dl.appendChild(o);
+      });
+      document.body.appendChild(dl);
+    }
   },
 
   init: function () {
@@ -2539,7 +2566,7 @@ var DemoModel = {
     });
   }
 };
-DSE.modules.demoModel = DemoModel;
+DSE.modules.demoApi = DemoApi;
 
 /* ===== settings/panel.js ===== */
 /* ============================================================
@@ -2875,7 +2902,7 @@ DSE.modules.panel = Panel;
     'nav',
     'zoom',
     'buttons',
-    'demoModel',
+    'demoApi',
     'panel'
   ];
   function boot() {

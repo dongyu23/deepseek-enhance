@@ -16,7 +16,7 @@
     'nav',
     'zoom',
     'buttons',
-    'demoModel',
+    'demoApi',
     'panel'
   ];
   function boot() {
