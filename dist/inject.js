@@ -83,7 +83,7 @@ var Bridge = {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DSE = window.DSE = {
-  version: '8.7.10',
+  version: '8.7.11',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   bridge: Bridge,
   modules: {},
@@ -261,7 +261,11 @@ var SEL_DEMO = {
   userBubble: '.bubble-_4cfe7',
   aiActionBar: '.actions-_4cfe7',
   thinkBlock: '.area-_3d93a',
-  thinkHeader: '.title-_3d93a'
+  thinkHeader: '.title-_3d93a',
+  // demo 思考区里除 .ds-think-content 外还有联网搜索的工具调用摘要块
+  // （"搜索到 N 个网页"/"浏览 N 个页面"，与正文是兄弟节点）——折叠时需
+  // 整块隐藏，只留折叠头，否则出现"头折叠了、搜索过程还露着"的半折叠态。
+  thinkCollapseAll: true
 };
 if (location.hostname === 'cdn.deepseek.com') {
   Object.keys(SEL_DEMO).forEach(function (k) { SEL[k] = SEL_DEMO[k]; });
@@ -1515,10 +1519,19 @@ var Think = {
   // area-_3d93a（见 selectors.js 的 SEL_DEMO）。静态 CSS 里写死主站哈希的
   // 旧规则在 demo 页完全不命中——body 挂着 dse-think-collapse 但思考内容
   // 照常显示，表现为「思考折叠没生效」。
+  // thinkCollapseAll（demo）：思考区里还有联网搜索的工具调用摘要块，与正文
+  // 是兄弟节点，只藏正文会剩半折叠态；这里把非折叠头的子块一并藏掉。
+  // :has(头) 保护包裹层——站点若把折叠头包进中间层，不会连标题一起藏。
   installCss: function () {
     try {
-      Bridge.addStyle('body.dse-think-collapse ' + SEL.thinkBlock + ':not(.dse-think-open) ' +
-        SEL.thinkContent + '{display:none!important}');
+      var block = SEL.thinkBlock, header = SEL.thinkHeader, content = SEL.thinkContent;
+      var css = 'body.dse-think-collapse ' + block + ':not(.dse-think-open) ' +
+        content + '{display:none!important}';
+      if (SEL.thinkCollapseAll) {
+        css += 'body.dse-think-collapse ' + block + ':not(.dse-think-open) > *:not(' + header +
+          '):not(:has(' + header + ')){display:none!important}';
+      }
+      Bridge.addStyle(css);
     } catch (e) {}
   },
   init: function () {
