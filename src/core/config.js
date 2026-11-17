@@ -29,6 +29,7 @@ var DEFAULT_CONFIG = {
   latexRender: true,                     // KaTeX 公式渲染（官网默认不渲染 \( \)/\[ \]/$...$）
   timeInject: false,                     // 时间注入
   ctxWarnPct: 80,                        // 上下文用量提醒阈值（百分比，达阈值弹提示）
+  demoModel: '',                         // chat-demo 页模型覆盖（空=用官方默认 deepseek-flash；只换 model 字段，其余原样）
 
   // 单会话系统提示词（独立开关，按会话隔离）
   systemPromptEnabled: false,
