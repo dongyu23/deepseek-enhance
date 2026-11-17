@@ -1,6 +1,6 @@
 # DeepSeek Enhance
 
-面向 [chat.deepseek.com](https://chat.deepseek.com/) 的油猴增强脚本：界面美化、水玻璃气泡、防撤回、按会话隔离的系统提示词、思考自动折叠、上下文用量等。手机浏览器（Kiwi / Edge / Safari 油猴扩展）与桌面端均适配，明暗双色自适应。
+面向 [chat.deepseek.com](https://chat.deepseek.com/) 与 [cdn.deepseek.com/chat-demo](https://cdn.deepseek.com/chat-demo)（API 使用 demo）的油猴增强脚本：界面美化、水玻璃气泡、防撤回、按会话隔离的系统提示词、思考自动折叠、上下文用量等。手机浏览器（Kiwi / Edge / Safari 油猴扩展）与桌面端均适配，明暗双色自适应。
 
 Android 套壳（DeepSleep）复用同一套增强脚本，并额外解决 WebView 场景下的文件选择（多选 / 相机）与后台恢复问题。
 
@@ -8,9 +8,11 @@ Android 套壳（DeepSleep）复用同一套增强脚本，并额外解决 WebVi
 
 先安装 Tampermonkey（或兼容用户脚本管理器），再点击安装：
 
-**[deepseek-enhance.user.js](https://raw.githubusercontent.com/Hiweny/deepseek-enhance/main/deepseek-enhance.user.js)**
+**[deepseek-enhance.user.js](https://raw.githubusercontent.com/dongyu23/deepseek-enhance/main/deepseek-enhance.user.js)**
 
-更新检查 meta：[deepseek-enhance.meta.js](https://raw.githubusercontent.com/Hiweny/deepseek-enhance/main/deepseek-enhance.meta.js)
+更新检查 meta：[deepseek-enhance.meta.js](https://raw.githubusercontent.com/dongyu23/deepseek-enhance/main/deepseek-enhance.meta.js)
+
+> 本仓库是 [Hiweny/deepseek-enhance](https://github.com/Hiweny/deepseek-enhance) 的 fork：代码保持官方基线，唯一改动是新增 `@match https://cdn.deepseek.com/chat-demo*`（让脚本同时作用于官方 API demo 页）及其适配。安装链接必须指向**本 fork**——点官方仓库的链接会装回原版，丢失 demo 页适配。
 
 设置入口在输入框工具条上（「深度思考 / 智能搜索」旁边的齿轮），位置与官网原生按钮一致，不新增悬浮入口。
 
