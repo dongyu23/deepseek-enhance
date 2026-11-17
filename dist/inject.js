@@ -83,7 +83,7 @@ var Bridge = {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DSE = window.DSE = {
-  version: '8.7.9',
+  version: '8.7.10',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   bridge: Bridge,
   modules: {},
@@ -855,9 +855,12 @@ Bridge.addStyle(`
 ._74c0879 .ds-think-content *{background:transparent!important}
 
 /* ===== 思考区 CSS 折叠（见 modules/think.js）=====
-   只隐藏正文，不点击、不移动站点节点 → 长对话滚动不再因高度突变而跳动 */
+   只隐藏正文，不点击、不移动站点节点 → 长对话滚动不再因高度突变而跳动。
+   内容隐藏规则由 think.js 按 SEL.thinkBlock 动态生成（主站/demo 通吃），
+   这里保留主站静态规则 + demo 的箭头旋转（构建哈希，官方重建后可能失效）。 */
 body.dse-think-collapse ._74c0879:not(.dse-think-open) .ds-think-content{display:none!important}
 body.dse-think-collapse ._74c0879:not(.dse-think-open) ._3d79d66{transform:rotate(-90deg)}
+body.dse-think-collapse .area-_3d93a:not(.dse-think-open) .title-_3d93a > svg{transform:rotate(-90deg)}
 
 /* 通用隐藏标记（移动版下载应用/AI 标识等由 JS 命中后打上） */
 [data-dse-hide]{display:none!important}
@@ -896,6 +899,17 @@ body.dark.dse-input-frosted ._77cefa5{box-shadow:0 8px 32px rgba(0,0,0,.4), inse
 body.dse-input-frosted ._77cefa5:focus-within{border-color:var(--dse-accent)!important;
   box-shadow:0 10px 36px rgba(59,108,246,.16)!important}
 body.dse-input-frosted textarea{background:transparent!important}
+/* chat-demo 输入框磨砂（构建哈希，官方重建后可能失效，见 selectors.js SEL_DEMO） */
+body.dse-input-frosted .wrapper-ed6f47{
+  background:var(--dse-frost)!important;
+  backdrop-filter:blur(20px) saturate(170%);-webkit-backdrop-filter:blur(20px) saturate(170%);
+  border:1px solid var(--dse-border)!important;border-radius:22px!important;
+  box-shadow:0 8px 32px rgba(15,23,42,.10), inset 0 1px 0 rgba(255,255,255,.5)!important;
+  transition:box-shadow .2s, border-color .2s}
+body.dark.dse-input-frosted .wrapper-ed6f47{box-shadow:0 8px 32px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,255,255,.06)!important}
+body.dse-input-frosted .wrapper-ed6f47:focus-within{border-color:var(--dse-accent)!important;
+  box-shadow:0 10px 36px rgba(59,108,246,.16)!important}
+body.dse-input-frosted .wrapper-ed6f47 textarea{background:transparent!important}
 @media (max-width:640px){
   body.dse-input-frosted ._77cefa5{border-radius:20px!important}
   /* 输入框与屏幕底部保持间距（含手势条安全区），间隙由固定背景层透出，不会出现黑条 */
@@ -1495,12 +1509,23 @@ var Think = {
     document.body.classList.toggle('dse-think-collapse', on);
   },
   clearOpen: function () {
-    document.querySelectorAll('._74c0879.dse-think-open').forEach(function (b) { b.classList.remove('dse-think-open'); });
+    document.querySelectorAll(SEL.thinkBlock + '.dse-think-open').forEach(function (b) { b.classList.remove('dse-think-open'); });
+  },
+  // 折叠规则按当前站点的思考块类名动态生成：主站 ._74c0879 / demo
+  // area-_3d93a（见 selectors.js 的 SEL_DEMO）。静态 CSS 里写死主站哈希的
+  // 旧规则在 demo 页完全不命中——body 挂着 dse-think-collapse 但思考内容
+  // 照常显示，表现为「思考折叠没生效」。
+  installCss: function () {
+    try {
+      Bridge.addStyle('body.dse-think-collapse ' + SEL.thinkBlock + ':not(.dse-think-open) ' +
+        SEL.thinkContent + '{display:none!important}');
+    } catch (e) {}
   },
   init: function () {
     var self = this;
     Utils.onReady(function () {
       self.syncBody();
+      self.installCss();
       // 接管折叠头点击：存在思考正文时用 CSS 显隐切换，杜绝站点移除 DOM 引起的滚动跳动
       document.addEventListener('click', function (e) {
         if (!DSE.config.get('thinkAutoCollapse')) return; // 关闭时完全交给站点原生行为
