@@ -17,6 +17,9 @@
     'zoom',
     'buttons',
     'demoApi',
+    'demoSearch',
+    'demoBridge',
+    'ctxRing',
     'panel'
   ];
   function boot() {

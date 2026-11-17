@@ -2,7 +2,7 @@
 // @name         DeepSeek Enhance 深度增强
 // @name:en      DeepSeek Enhance
 // @namespace    https://github.com/Hiweny/deepseek-enhance
-// @version      8.7.17
+// @version      8.8.0
 // @description  气泡材质(默认iOS磨砂)/思考自动折叠/代码块自动折叠/中英文界面/Markdown本地美化/LaTeX/图片URL背景/顶栏背景透出/按会话隔离的系统提示词(新对话可先填后发)/防撤回/上下文用量/消息导航(虚拟列表适配)/输入框磨砂/移动端适配
 // @updateURL    https://raw.githubusercontent.com/dongyu23/deepseek-enhance/main/deepseek-enhance.meta.js
 // @downloadURL  https://raw.githubusercontent.com/dongyu23/deepseek-enhance/main/deepseek-enhance.user.js
@@ -106,7 +106,7 @@ var Bridge = {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DSE = window.DSE = {
-  version: '8.7.17',
+  version: '8.8.0',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   bridge: Bridge,
   modules: {},
@@ -156,9 +156,15 @@ var DEFAULT_CONFIG = {
   latexRender: true,                     // KaTeX 公式渲染（官网默认不渲染 \( \)/\[ \]/$...$）
   timeInject: false,                     // 时间注入
   ctxWarnPct: 80,                        // 上下文用量提醒阈值（百分比，达阈值弹提示）
+  demoCustom: false,                      // chat-demo 页自定义模型总开关：关=完全官方逻辑（DeepSeek 模型/端点/搜索，脚本零干预）
   demoEndpoint: '',                      // chat-demo 页 API 端点覆盖（空=官方 api.deepseek.com/anthropic/v1；不含 /messages）
   demoKey: '',                           // chat-demo 页 API Key 覆盖（空=用页面里填的官方 Key）
   demoModel: '',                         // chat-demo 页模型覆盖（空=用官方默认 deepseek-flash）
+  demoCtxLimit: 128000,                   // 自定义模型的上下文窗口（tokens，用于占用环百分比；按所用模型自行调整）
+  demoToolMode: 'native',                // 自定义端点时的工具调用方式：native=DeepSeek 模型在对话中驱动搜索（含模型 token 费）/ searchapi=直调独立搜索 API（仅付 $0.75/1000 次）
+  demoKeyHeader: 'x-api-key',            // 覆盖 Key 的请求头写法：x-api-key / authorization（StepFun 等只放行 Authorization）
+  demoBridge: 'auto',                   // 第三方端点时的工具桥接：auto(端点非 deepseek 即启用) / on / off
+  demoTitleSource: 'deepseek',          // 第三方端点时的会话标题来源：deepseek=起名腿打 DeepSeek 官方端点（title 参数，约 $0.001/次）/ model=当前自定义模型按提示词起名（费用走第三方）/ off=不起名，用首条消息截断
 
   // 单会话系统提示词（独立开关，按会话隔离）
   systemPromptEnabled: false,
@@ -182,7 +188,13 @@ var Config = {
     if (this._cache) return this._cache;
     var saved = Bridge.get(CFG_KEY, null);
     var cfg = cloneDefaults();
-    if (saved && typeof saved === 'object') this._merge(cfg, saved);
+    if (saved && typeof saved === 'object') {
+      this._merge(cfg, saved);
+      // 旧配置迁移：demoAutoTitle（布尔开关）→ demoTitleSource（三选一）。
+      // _merge 只合并在 defaults 里存在的键，旧键会被静默丢弃——不在这里显式
+      // 映射的话，"关过起名"的用户升级后会被默认值重新打开
+      if (saved.demoAutoTitle === false && !('demoTitleSource' in saved)) cfg.demoTitleSource = 'off';
+    }
     this._cache = cfg;
     return cfg;
   },
@@ -288,6 +300,10 @@ var SEL_DEMO = {
   aiActionBar: '.actions-_4cfe7',
   thinkBlock: '.area-_3d93a',
   thinkHeader: '.title-_3d93a',
+  // demo 页左上角与应用结构（会话搜索入口/侧边栏条目用；收起边栏按钮按
+  // aria-label 文本匹配，不依赖哈希）
+  appTop: '.top-ac14ac',
+  sidebarItem: '.item-ff6fc9',
   // demo 是客户端直连 api.deepseek.com：无服务端会话 id、无 history_messages
   // 接口、无 accumulated_token_usage 真值——上下文用量统计整段不适用，
   // 设置面板里对应分区（含"立即重新统计"按钮）据此隐藏。
@@ -460,6 +476,48 @@ var I18N = {
     '隐式时间注入': 'Implicit time injection',
     // ---------- chat-demo 模型切换 ----------
     'API 端点': 'API endpoint',
+    '自定义模型': 'Custom model',
+    '工具调用方式': 'Tool invocation',
+    '只填消息接口地址：到 /messages 为止，不要包含 /messages 本身（例：https://api.stepfun.com/step_plan/v1）。留空 = 官方 https://api.deepseek.com/anthropic/v1': 'Messages endpoint only: up to but excluding /messages itself (e.g. https://api.stepfun.com/step_plan/v1). Leave empty for the official https://api.deepseek.com/anthropic/v1',
+    '模型要搜索时，谁来执行：native=交给 DeepSeek 的模型在对话里完成，能多轮搜、能读网页，但每轮搜索另付约 2 分钱模型费；searchapi=直接调 DeepSeek 的搜索接口，一次约 0.00075 美元、不经模型，搜什么由当前模型决定。两种在界面上看起来一样': 'Who runs the search when the model asks for one: native = the DeepSeek model does it inside the conversation (multi-round search and page reads; each round costs about 2 cents in model tokens). searchapi = call the DeepSeek search API directly, about $0.00075 per call, no model involved; the current model decides what to search. Both look identical in the UI',
+    '模型要搜索时谁来执行：native=DeepSeek 的模型自己搜，另付约 2 分钱/轮模型费；searchapi=直调搜索接口，每次约 0.00075 美元、不经模型': 'Who runs a search when the model asks: native = the DeepSeek model searches itself (about 2 cents per round in model fees); searchapi = call the search API directly (about $0.00075 per call, no model involved)',
+    '起名来源': 'Title source',
+    'deepseek：官方起名腿': 'deepseek: official title leg',
+    'model：自定义模型起名': 'model: custom model titles it',
+    'off：用首条消息截断': 'off: truncated first message',
+    '新对话首轮回答后生成会话标题的来源：deepseek=打 DeepSeek 官方端点用 title 参数起名（约 $0.001/次、标题质量官方级、用页面里那把 DeepSeek Key）；model=让当前自定义模型按提示词起名（一次极小非流式请求、费用走当前端点、不经 DeepSeek）；off=不起名，用首条消息截断。任一来源失败都退回首条消息截断': 'Who generates the session title after the first reply of a new chat: deepseek = a title leg against the official DeepSeek endpoint using the title parameter (about $0.001 per call, official-quality titles, uses the DeepSeek key entered on the page); model = the current custom model titles it from a prompt (one tiny non-streaming request, billed to the current endpoint, no DeepSeek involved); off = no title, truncated first message. Any source falls back to the truncated first message on failure',
+    'deepseek：官方起名腿，约 $0.001/次；model：自定义模型起名，费用走当前端点；off：用首条消息截断': 'deepseek: official title leg, about $0.001 per call; model: titled by the custom model, billed to the current endpoint; off: truncated first message',
+    // 会话搜索（官方主站同款文案）
+    '搜索对话内容...': 'Search conversation content...',
+    '暂无相关结果': 'No matching results',
+    '新对话': 'New chat',
+    'native：模型自己搜': 'native: model-driven',
+    'searchapi：只付搜索费': 'searchapi: search fee only',
+    'native（原生）': 'native (native tools)',
+    '上下文容量': 'Context capacity',
+    '消息': 'Messages',
+    '系统提示词': 'System prompt',
+    '系统工具': 'Tools',
+    '平均缓存命中率': 'Avg cache hit rate',
+    '总量与缓存命中率为接口 usage 精确值；构成占比按请求结构估算': 'Total and cache hit rate are exact values from the API usage; the composition split is estimated from the request structure',
+    '上下文占用': 'Context usage',
+    '上下文窗口': 'Context window',
+    '所用模型的上下文窗口（tokens）。输入框旁的圆圈按 占用/窗口 显示百分比': 'The context window of the model in use (tokens). The ring beside the input box shows usage / window as a percentage',
+    '来自模型接口返回的 usage 精确值（系统提示 + 工具 + 完整历史）': 'Exact value from the usage field returned by the model API (system prompt + tools + full history)',
+    '测试连接与模型身份': 'Test connection & model identity',
+    '测试': 'Test',
+    '测试中…': 'Testing…',
+    '连接成功': 'Connected',
+    '连接失败': 'Connection failed',
+    '请求失败': 'Request failed',
+    '模型自述': 'Model says',
+    '（未获得文本回复）': '(no text reply)',
+    '（浏览器安全策略拦截了跨域请求，可在高级选项切换鉴权头试试）': '(blocked by browser CORS policy — try switching the auth header in Advanced options)',
+    '你是什么AI模型？请用一句话直接说明你的模型名称和开发方，不要复述这个问题。': 'What AI model are you? State your model name and developer in one sentence. Do not repeat this question.',
+    '鉴权头': 'Auth header',
+    '工具桥接': 'Tool bridge',
+    'x-api-key（默认）或 authorization（Bearer）。StepFun 等端点的 CORS 只放行 Authorization': 'x-api-key (default) or authorization (Bearer). StepFun and similar endpoints only allow Authorization via CORS',
+    'auto=端点非 deepseek 时启用（默认）；on=强制启用；off=关闭（工具随端点丢失）': 'auto = enabled when the endpoint is not deepseek (default); on = force; off = disabled (tools lost with the endpoint)',
     'API Key': 'API key',
     '（用页面里填的官方 Key）': '(use the official key entered on the page)',
     '留空 = 用官方设置里填的 Key；填写则替换请求头 x-api-key': 'Leave empty to use the key entered in the official settings; a value here replaces the x-api-key request header',
@@ -2444,12 +2502,17 @@ DSE.modules.buttons = Buttons;
  *     代码注释与交付说明——解耦需要客户端 agent 桥接，未做。
  * ============================================================ */
 var DemoApi = {
-  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel' },
+  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', keyHeader: 'demoKeyHeader', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
   DEFAULT_BASE: 'https://api.deepseek.com/anthropic/v1',
   // 模型输入建议（datalist），不限制手输
   HINTS: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-flash'],
 
-  cfg: function (k) { return (DSE.config.get(this.KEYS[k]) || '').trim(); },
+  // 注意：配置值不一定是字符串（如 demoCtxLimit 默认是数字 128000），
+  // 直接 .trim() 会抛 TypeError 导致整个设置块注入失败
+  cfg: function (k) {
+    var v = DSE.config.get(this.KEYS[k]);
+    return (v == null) ? '' : String(v);
+  },
   base: function () { return this.cfg('endpoint').replace(/\/+$/, ''); },
 
   /* ---------- 请求改写：端点 / Key / 模型 ---------- */
@@ -2457,11 +2520,15 @@ var DemoApi = {
     var self = this;
     if (!window.fetch) return;
     var orig = window.fetch;
+    DemoApi._origFetch = orig;   // 桥接的出站请求走原生 fetch，避开本补丁的 URL 改写（否则搜索腿会被改写到第三方端点）
     window.fetch = function (input, init) {
       try {
         var url = typeof input === 'string' ? input : (input && input.url) || '';
-        if (url.indexOf('/anthropic/v1/messages') !== -1) {
+        // 总开关关闭 = 完全官方逻辑（端点/Key/模型/桥接全部不干预）
+        if (url.indexOf('/anthropic/v1/messages') !== -1 && DSE.config.get('demoCustom')) {
           var base = self.base(), key = self.cfg('key'), model = self.cfg('model');
+          // 页面原始 DeepSeek Key（供桥接的搜索腿使用，先于任何覆盖捕获）
+          var origDsKey = (init && init.headers && (init.headers['x-api-key'] || init.headers['X-API-Key'] || init.headers['X-Api-Key'])) || '';
           // 1) 端点：替换 base（已带 /messages 则原样用）
           if (base) url = /\/messages$/.test(base) ? base : base + '/messages';
           // 2) 请求头：x-api-key
@@ -2479,6 +2546,12 @@ var DemoApi = {
               init = Object.assign({}, init, { body: JSON.stringify(body) });
             }
           }
+          // 4) 桥接：端点非 DeepSeek 时，工具执行拆成「客户端工具循环 +
+          //    DeepSeek 极小搜索腿」，demo 侧呈现仍为原生块（见 demobridge.js）
+          if (DSE.modules.demoBridge && DSE.modules.demoBridge.active()) {
+            var bridged = DSE.modules.demoBridge.intercept(url, init, origDsKey);
+            if (bridged) return bridged;
+          }
         }
       } catch (e) {}
       return orig.call(this, url, init);
@@ -2489,10 +2562,24 @@ var DemoApi = {
   injectUI: function () {
     var dlg = document.querySelector('[class*="dialogMain-"]');
     if (!dlg) return;
-    var refRow = dlg.querySelector('[class*="cell-"][class*="row-"]');
-    if (!refRow || !refRow.parentElement) return;
-    var content = refRow.parentElement;
-    if (content.querySelector('[data-dse-api-row]')) return;
+    // 锚点 = 当前可见的「通用设置最后一个分区」（主题/语言/朗读音色/位置信息，
+    // 前缀匹配——位置信息行全文是"位置信息请选择省份/地区请选择市"）。
+    // 要求可见：渲染中途/数据管理 tab 下通用分区是隐藏的，此时注入会落错位置
+    var anchor = null;
+    Array.prototype.forEach.call(dlg.querySelectorAll('[class*="cell-"]'), function (c) {
+      var t = (c.textContent || '').replace(/\s/g, '');
+      if (/^(主题|语言|朗读音色|位置信息)/.test(t) && c.offsetParent !== null) anchor = c;
+    });
+    var existing = dlg.querySelector('[data-dse-api-wrap]');
+    if (!anchor) return;                       // 没有可见锚点：不注入（已有的留着，tab 同步会藏）
+    if (existing) {
+      // 位置自愈：React 重排（切 tab 等）会把外来节点挤到前面——不对就重注
+      if (existing.isConnected && existing.previousElementSibling === anchor) return;
+      existing.remove();
+    }
+    var refRow = anchor;
+    var content = anchor.parentElement;
+    if (!content) return;
     var pick = function (el, props) {
       var cs = getComputedStyle(el), o = {};
       props.forEach(function (p) { o[p] = cs[p]; });
@@ -2502,21 +2589,26 @@ var DemoApi = {
     var refCtrl = refRow.querySelector('button') || refRow;
     var labelCss = pick(refLabel, ['color', 'fontSize']);
     var ctrlCss = pick(refCtrl, ['backgroundColor', 'color']);
-    var ctrlStyle = 'width:260px;height:36px;border:none;outline:none;border-radius:18px;padding:0 14px;' +
+    // 注意 box-sizing：demo 的全局 reset 不覆盖注入节点，默认 content-box 会
+    // 让 60px 的行变成 84px（padding 外加）——与官方行观感不一致
+    var rowBase = 'display:flex;align-items:center;gap:8px;box-sizing:border-box;min-height:60px;padding:12px 0;font-size:14px';
+    var ctrlStyle = 'box-sizing:border-box;width:240px;height:36px;border:none;outline:none;border-radius:18px;padding:0 14px;' +
       'font-size:14px;background:' + (ctrlCss.backgroundColor || 'rgba(127,127,127,.18)') + ';' +
       'color:' + (ctrlCss.color || 'inherit');
+    var descStyle = 'box-sizing:border-box;font-size:12px;line-height:1.5;opacity:.55;padding:0 0 6px';
 
     var self = this;
-    var mkRow = function (labelText, cfgKey, placeholder, title, isPassword) {
+    var mkRow = function (labelText, cfgKey, placeholder, title, isPassword, hints, listId) {
       var row = document.createElement('div');
       row.setAttribute('data-dse-api-row', cfgKey);
-      row.style.cssText = 'display:flex;align-items:center;gap:8px;min-height:60px;padding:12px 0;font-size:14px';
+      row.style.cssText = rowBase;
       var label = document.createElement('div');
       label.textContent = DSE.t(labelText);
       label.style.cssText = 'flex:1;font-size:' + (labelCss.fontSize || '14px') + ';color:' + (labelCss.color || 'inherit');
       var input = document.createElement('input');
       input.type = isPassword ? 'password' : 'text';
-      if (cfgKey === 'model') input.setAttribute('list', 'dse-model-hints');
+      if (hints && listId) input.setAttribute('list', listId);
+      else if (cfgKey === 'model') input.setAttribute('list', 'dse-model-hints');
       input.placeholder = placeholder;
       input.value = self.cfg(cfgKey);
       input.title = title;
@@ -2535,38 +2627,1454 @@ var DemoApi = {
       return row;
     };
 
-    content.appendChild(mkRow('API 端点', 'endpoint', DemoApi.DEFAULT_BASE,
-      DSE.t('留空 = 官方 ' + DemoApi.DEFAULT_BASE + '。填模型提供方的 Anthropic 协议 base（不含 /messages）。注意：换走后 deepseek_* 工具对方不认')));
-    content.appendChild(mkRow('API Key', 'key', DSE.t('（用页面里填的官方 Key）'),
-      DSE.t('留空 = 用官方设置里填的 Key；填写则替换请求头 x-api-key'), true));
-    content.appendChild(mkRow('模型', 'model', DSE.t('deepseek-flash（官方默认）'),
-      DSE.t('留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段')));
+    // 固定选项（鉴权头/桥接）用原生下拉，不用带 datalist 的文本框
+    var CHEVRON = "url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path d='M1 1l4 4 4-4' stroke='%23888' fill='none' stroke-width='1.5' stroke-linecap='round'/></svg>\")";
+    var mkSelect = function (labelText, cfgKey, options, defVal, title) {
+      var row = document.createElement('div');
+      row.setAttribute('data-dse-api-row', cfgKey);
+      row.style.cssText = rowBase;
+      var label = document.createElement('div');
+      label.textContent = DSE.t(labelText);
+      label.style.cssText = 'flex:1;font-size:' + (labelCss.fontSize || '14px') + ';color:' + (labelCss.color || 'inherit');
+      var sel = document.createElement('select');
+      sel.title = title;
+      sel.style.cssText = ctrlStyle + 'appearance:none;-webkit-appearance:none;cursor:pointer;' +
+        'padding-right:32px;background-image:' + CHEVRON + ';background-repeat:no-repeat;background-position:right 12px center;';
+      options.forEach(function (o) {
+        var opt = document.createElement('option');
+        opt.value = o[0]; opt.textContent = DSE.t(o[1]);
+        sel.appendChild(opt);
+      });
+      sel.value = self.cfg(cfgKey) || defVal;
+      sel.addEventListener('change', function () { DSE.config.set(self.KEYS[cfgKey], sel.value); });
+      row.appendChild(label);
+      row.appendChild(sel);
+      return row;
+    };
 
-    if (!document.getElementById('dse-model-hints')) {
+    var wrap = document.createElement('div');
+    wrap.setAttribute('data-dse-api-wrap', '1');
+
+    // 主开关：关=完全官方逻辑（DeepSeek 全套）；开=才允许自定义
+    var swRow = document.createElement('div');
+    swRow.setAttribute('data-dse-api-row', 'custom');
+    swRow.style.cssText = rowBase + 'cursor:pointer;user-select:none';
+    var swLabel = document.createElement('div');
+    swLabel.textContent = DSE.t('自定义模型');
+    swLabel.style.cssText = 'flex:1;font-size:' + (labelCss.fontSize || '14px') + ';color:' + (labelCss.color || 'inherit');
+    var swTrack = document.createElement('div');
+    var swKnob = document.createElement('div');
+    swTrack.style.cssText = 'width:44px;height:26px;border-radius:13px;position:relative;transition:background .15s;flex:0 0 auto';
+    swKnob.style.cssText = 'position:absolute;top:2px;left:2px;width:22px;height:22px;border-radius:50%;background:#fff;transition:left .15s;box-shadow:0 1px 3px rgba(0,0,0,.3)';
+    swTrack.appendChild(swKnob);
+    var cfgBox = document.createElement('div');
+    cfgBox.setAttribute('data-dse-cfg-box', '1');
+    var paintSw = function (on) {
+      var accent = getComputedStyle(document.documentElement).getPropertyValue('--dse-accent').trim() || '#3b6cf6';
+      swTrack.style.background = on ? accent : 'rgba(127,127,127,.35)';
+      swKnob.style.left = on ? '20px' : '2px';
+      cfgBox.style.display = on ? 'block' : 'none';
+    };
+    swRow.addEventListener('click', function () {
+      var v = !DSE.config.get('demoCustom');
+      DSE.config.set('demoCustom', v);
+      paintSw(v);
+    });
+    paintSw(!!DSE.config.get('demoCustom'));
+    swRow.appendChild(swLabel); swRow.appendChild(swTrack);
+    wrap.appendChild(swRow);
+    wrap.appendChild(cfgBox);
+
+    // 行+可见描述行的包装。注意：这是 var 函数表达式，定义必须在所有调用
+    // 之前——早前端点/Key 行在定义之前调用，执行时 withDesc 还是 undefined，
+    // TypeError 让整个 injectUI 中断、设置块整体不注入（实机抓到）
+    var withDesc = function (row, desc) {
+      var d = document.createElement('div');
+      d.style.cssText = descStyle;
+      d.textContent = DSE.t(desc);
+      var box = document.createElement('div');
+      box.appendChild(row); box.appendChild(d);
+      return box;
+    };
+
+    // 布尔开关行（与主开关同款样式）——供高级选项里的布尔配置用
+    var mkSwitch = function (labelText, cfgKey, desc) {
+      var row = document.createElement('div');
+      row.setAttribute('data-dse-api-row', cfgKey);
+      row.style.cssText = rowBase + 'cursor:pointer;user-select:none';
+      var label = document.createElement('div');
+      label.textContent = DSE.t(labelText);
+      label.style.cssText = 'flex:1;font-size:' + (labelCss.fontSize || '14px') + ';color:' + (labelCss.color || 'inherit');
+      var track = document.createElement('div');
+      var knob = document.createElement('div');
+      track.style.cssText = swTrack.style.cssText;
+      knob.style.cssText = swKnob.style.cssText;
+      track.appendChild(knob);
+      var paint = function (on) {
+        var accent = getComputedStyle(document.documentElement).getPropertyValue('--dse-accent').trim() || '#3b6cf6';
+        track.style.background = on ? accent : 'rgba(127,127,127,.35)';
+        knob.style.left = on ? '20px' : '2px';
+      };
+      row.addEventListener('click', function () {
+        var v = !DSE.config.get(self.KEYS[cfgKey]);
+        DSE.config.set(self.KEYS[cfgKey], v);
+        paint(!!v);
+      });
+      paint(!!DSE.config.get(self.KEYS[cfgKey]));
+      row.appendChild(label); row.appendChild(track);
+      return desc ? withDesc(row, desc) : row;
+    };
+
+    // 端点/Key 两行的说明较长，既放可见描述行（withDesc），也放输入框
+    // hover 提示（title），两处共用同一字符串
+    var ENDPOINT_DESC = DSE.t('只填消息接口地址：到 /messages 为止，不要包含 /messages 本身（例：https://api.stepfun.com/step_plan/v1）。留空 = 官方 ' + DemoApi.DEFAULT_BASE);
+    var KEY_DESC = DSE.t('留空 = 用官方设置里填的 Key；填写则替换请求头 x-api-key');
+    cfgBox.appendChild(withDesc(mkRow('API 端点', 'endpoint', DemoApi.DEFAULT_BASE, ENDPOINT_DESC), ENDPOINT_DESC));
+    cfgBox.appendChild(withDesc(mkRow('API Key', 'key', DSE.t('（用页面里填的官方 Key）'), KEY_DESC, true), KEY_DESC));
+    cfgBox.appendChild(mkRow('模型', 'model', DSE.t('deepseek-flash（官方默认）'),
+      DSE.t('留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段'), false, DemoApi.HINTS, 'dse-model-hints'));
+    // 模型测试：一发极小请求验证端点/Key/模型是否可用，并让模型自述身份——
+    // DeepSeek 会答"我是DeepSeek"，第三方模型会答出自己的真实身份，用户据此
+    // 确认切换真的生效了
+    var testRow = document.createElement('div');
+    testRow.setAttribute('data-dse-api-row', 'test');
+    testRow.style.cssText = rowBase;
+    var testLabel = document.createElement('div');
+    testLabel.textContent = DSE.t('测试连接与模型身份');
+    testLabel.style.cssText = 'flex:1;font-size:' + (labelCss.fontSize || '14px') + ';color:' + (labelCss.color || 'inherit');
+    var testBtn = document.createElement('button');
+    testBtn.type = 'button';
+    testBtn.textContent = DSE.t('测试');
+    var accent = getComputedStyle(document.documentElement).getPropertyValue('--dse-accent').trim() || '#3b6cf6';
+    testBtn.style.cssText = 'box-sizing:border-box;height:36px;border:none;outline:none;cursor:pointer;' +
+      'border-radius:18px;padding:0 20px;font-size:14px;background:' + accent + ';color:#fff;flex:0 0 auto';
+    var testResult = document.createElement('div');
+    testResult.setAttribute('data-dse-test-result', '1');
+    testResult.style.cssText = 'display:none;box-sizing:border-box;font-size:12px;line-height:1.6;padding:2px 0 8px;white-space:pre-wrap;word-break:break-all';
+    testBtn.addEventListener('click', function () {
+      testResult.style.display = 'block';
+      testResult.style.color = 'inherit';
+      testResult.textContent = DSE.t('测试中…');
+      var t0 = Date.now();
+      var base = self.base() || DemoApi.DEFAULT_BASE;
+      var u = /\/messages$/.test(base) ? base : base.replace(/\/+$/, '') + '/messages';
+      var model = (DSE.config.get('demoModel') || '').trim() || 'deepseek-flash';
+      // Key：覆盖值优先；否则取页面里填的官方 Key（demo 存于 localStorage）
+      var key = (DSE.config.get('demoKey') || '').trim();
+      if (!key) { try { key = localStorage.getItem('chat-demo:api-key') || ''; } catch (e) {} }
+      var headers = { 'Content-Type': 'application/json' };
+      if (key) {
+        if ((DSE.config.get('demoKeyHeader') || 'x-api-key') === 'authorization') headers['Authorization'] = 'Bearer ' + key;
+        else headers['x-api-key'] = key;
+      }
+      (DemoApi._origFetch || window.fetch)(u, {
+        method: 'POST', headers: headers,
+        body: JSON.stringify({
+          model: model, max_tokens: 1024, thinking: { type: 'disabled' },
+          messages: [{ role: 'user', content: DSE.t('你是什么AI模型？请用一句话直接说明你的模型名称和开发方，不要复述这个问题。') }]
+        })
+      }).then(function (resp) {
+        var ms = Date.now() - t0;
+        if (!resp.ok) {
+          return resp.text().then(function (t) {
+            var m = t; try { var j = JSON.parse(t); m = (j.error && j.error.message) || t; } catch (e) {}
+            testResult.style.color = '#f87171';
+            testResult.textContent = '❌ ' + DSE.t('连接失败') + '（HTTP ' + resp.status + '，' + ms + 'ms）\n' + String(m).slice(0, 200);
+          });
+        }
+        return resp.json().then(function (j) {
+          var txt = (j.content || []).filter(function (b) { return b.type === 'text'; })
+            .map(function (b) { return b.text || ''; }).join('').trim();
+          testResult.style.color = '#4ade80';
+          testResult.textContent = '✅ ' + DSE.t('连接成功') + '（' + ms + 'ms）· ' + DSE.t('模型') + '：' + (j.model || model) +
+            '\n' + DSE.t('模型自述') + '：' + (txt ||
+            (DSE.t('（未获得文本回复') + '，stop_reason=' + (j.stop_reason || '?') + '，内容块=' + (j.content || []).map(function (b) { return b.type; }).join(',') + '）'));
+        });
+      }).catch(function (e) {
+        testResult.style.color = '#f87171';
+        var hint = (e && e.name === 'TypeError') ? DSE.t('（浏览器安全策略拦截了跨域请求，可在高级选项切换鉴权头试试）') : '';
+        testResult.textContent = '❌ ' + DSE.t('请求失败') + '：' + String(e && e.message || e).slice(0, 150) + hint;
+      });
+    });
+    testRow.appendChild(testLabel); testRow.appendChild(testBtn);
+    cfgBox.appendChild(testRow);
+    cfgBox.appendChild(testResult);
+
+    // 高级选项：默认折叠，配人话说明（这两个是排障开关，不是常规配置）
+    var advToggle = document.createElement('div');
+    advToggle.setAttribute('data-dse-api-row', 'advanced');
+    advToggle.style.cssText = rowBase + 'cursor:pointer;user-select:none';
+    var advLabel = document.createElement('div');
+    advLabel.textContent = DSE.t('高级选项');
+    advLabel.style.cssText = 'flex:1;font-size:' + (labelCss.fontSize || '14px') + ';color:' + (labelCss.color || 'inherit');
+    var advArrow = document.createElement('span');
+    advArrow.textContent = '⌄';
+    advArrow.style.cssText = 'transition:transform .15s;opacity:.6;font-size:16px;width:24px;text-align:center';
+    advToggle.appendChild(advLabel); advToggle.appendChild(advArrow);
+    var advBox = document.createElement('div');
+    advBox.setAttribute('data-dse-advanced', '1');
+    advBox.style.display = 'none';
+    advToggle.addEventListener('click', function () {
+      var open = advBox.style.display !== 'none';
+      advBox.style.display = open ? 'none' : 'block';
+      advArrow.style.transform = open ? '' : 'rotate(180deg)';
+    });
+    // 工具调用方式：选项文本已自明（native：模型自己搜 / searchapi：只付搜索费），
+    // 可见描述行给一句人话结论，完整差异（计费/能力）放 hover 提示
+    var TOOLMODE_TITLE = DSE.t('模型要搜索时，谁来执行：native=交给 DeepSeek 的模型在对话里完成，能多轮搜、能读网页，但每轮搜索另付约 2 分钱模型费；searchapi=直接调 DeepSeek 的搜索接口，一次约 0.00075 美元、不经模型，搜什么由当前模型决定。两种在界面上看起来一样');
+    var TOOLMODE_DESC = DSE.t('模型要搜索时谁来执行：native=DeepSeek 的模型自己搜，另付约 2 分钱/轮模型费；searchapi=直调搜索接口，每次约 0.00075 美元、不经模型');
+    advBox.appendChild(withDesc(mkSelect('工具调用方式', 'toolMode',
+      [['native', 'native：模型自己搜'], ['searchapi', 'searchapi：只付搜索费']], 'native', TOOLMODE_TITLE), TOOLMODE_DESC));
+    // 起名来源：官方页的 title 通道第三方端点没有，用一条极小腿补。来源三选一
+    // ——deepseek=官方端点起名腿（title 参数、约 $0.001/次、标题质量官方级）；
+    // model=当前自定义模型按提示词起名（费用走当前端点、不经 DeepSeek）；
+    // off=不起名（首条消息截断）。任一来源失败都退回首条消息截断
+    var TITLE_SOURCE_TITLE = DSE.t('新对话首轮回答后生成会话标题的来源：deepseek=打 DeepSeek 官方端点用 title 参数起名（约 $0.001/次、标题质量官方级、用页面里那把 DeepSeek Key）；model=让当前自定义模型按提示词起名（一次极小非流式请求、费用走当前端点、不经 DeepSeek）；off=不起名，用首条消息截断。任一来源失败都退回首条消息截断');
+    var TITLE_SOURCE_DESC = DSE.t('deepseek：官方起名腿，约 $0.001/次；model：自定义模型起名，费用走当前端点；off：用首条消息截断');
+    advBox.appendChild(withDesc(mkSelect('起名来源', 'titleSource',
+      [['deepseek', 'deepseek：官方起名腿'], ['model', 'model：自定义模型起名'], ['off', 'off：用首条消息截断']], 'deepseek', TITLE_SOURCE_TITLE), TITLE_SOURCE_DESC));
+    advBox.appendChild(withDesc(mkRow('上下文窗口', 'ctxLimit', '128000',
+      DSE.t('所用模型的上下文窗口（tokens）。输入框旁的圆圈按 占用/窗口 显示百分比'), false, null, null),
+      DSE.t('所用模型的上下文窗口（tokens）。输入框旁的圆圈按 占用/窗口 显示百分比')));
+    advBox.appendChild(withDesc(mkSelect('Key 请求头', 'keyHeader',
+      [['x-api-key', 'x-api-key（默认）'], ['authorization', 'authorization（Bearer）']], 'x-api-key'),
+      '个别网站（如 StepFun）的浏览器安全策略只认 Authorization 请求头，连不上时改选 authorization'));
+    advBox.appendChild(withDesc(mkSelect('搜索来源', 'bridge',
+      [['auto', 'auto：DeepSeek 原生搜索'], ['off', 'off：用模型自带的']], 'auto'),
+      'auto=换第三方模型时，搜索仍由 DeepSeek 原生执行、界面原样呈现（推荐）；off=完全使用第三方自己的能力（多数没有搜索）'));
+    cfgBox.appendChild(advToggle);
+    cfgBox.appendChild(advBox);
+
+    var mkList = function (id, items) {
+      if (document.getElementById(id)) return;
       var dl = document.createElement('datalist');
-      dl.id = 'dse-model-hints';
-      this.HINTS.forEach(function (m) {
+      dl.id = id;
+      items.forEach(function (m) {
         var o = document.createElement('option');
         o.value = m;
         dl.appendChild(o);
       });
       document.body.appendChild(dl);
-    }
+    };
+    mkList('dse-model-hints', this.HINTS);
+
+    anchor.after(wrap);
+    //  tab 同步：锚定行（语言）被隐藏说明当前在数据管理 tab → 连同我们的行一起藏。
+    //  用锚定行可见性判断而非 tab 类名——不猜官方的隐藏机制
+    // tab 同步：当前 DOM 里找不到「语言」行（或它被隐藏）说明在数据管理 tab
+    // → 连同我们的行一起藏。每次重新查询——tab 切换时官方会移除/重建分区，
+    // 持有旧引用会因元素 detached 而永远判断为“该藏”
+    (function syncTab() {
+      if (!wrap.isConnected) return;
+      var lang = null;
+      Array.prototype.forEach.call(dlg.querySelectorAll('[class*="cell-"]'), function (r) {
+        if (lang) return;
+        var t = (r.textContent || '').replace(/\s/g, '');
+        if (t.indexOf('语言') !== -1 && t.length < 12) lang = r;
+      });
+      wrap.style.display = (!lang || lang.offsetParent === null) ? 'none' : '';
+      setTimeout(syncTab, 400);
+    })();
+  },
+
+  // demo 页左上角的应用名是纯文字“API 使用 demo”，与 DeepSeek 官方标识不一致。
+  // 官方主站的标识是内联 SVG（鲸鱼 + DeepSeek 字标，143×23）——fe-static 上没有
+  // 对应静态文件、只存在于主站 bundle，故以资源文件随脚本分发、构建时内联。
+  // SVG 的 fill 用 var(--dsw-alias-brand-primary)，该变量由标识元素自身携带
+  // （#5686fe，官方主站同款），整套 markup 原样可用、无需替换颜色
+  OFFICIAL_LOGO: '<svg width="143" height="23" viewBox="0 0 143 23" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M78.6785 18.6823H77.1078V16.2472H78.6785C79.6513 16.2472 80.6342 16.0047 81.2672 15.3308C81.9009 14.6569 82.14 13.6232 82.14 12.59C82.14 11.5569 81.9109 10.5231 81.2672 9.84981C80.6247 9.17594 79.6513 8.93343 78.6785 8.93343C77.7056 8.93343 76.7228 9.17594 76.0886 9.84981C75.4549 10.5237 75.2158 11.5569 75.2158 12.59V22.5909H72.4605V6.50781H75.2158V7.53204H75.7209C75.7757 7.4689 75.8304 7.41525 75.8857 7.36161C76.5752 6.73244 77.6308 6.50781 78.6684 6.50781C80.2944 6.50781 81.9193 6.91236 82.9849 8.03549C84.0499 9.15861 84.4265 10.8835 84.4265 12.6001C84.4265 14.3166 84.0404 16.0326 82.9849 17.1647C81.9288 18.2967 80.2944 18.6834 78.6785 18.6834V18.6823Z" fill="var(--dsw-alias-brand-primary)"></path><path d="M36.7486 6.94097H38.3188V9.37609H36.7486C35.7753 9.37609 34.7929 9.61859 34.1593 10.2925C33.5257 10.9663 33.2871 12.0001 33.2871 13.0332C33.2871 14.0664 33.5167 15.0996 34.1593 15.7734C34.8019 16.4473 35.7753 16.6898 36.7486 16.6898C37.722 16.6898 38.7049 16.4473 39.3385 15.7734C39.9722 15.0996 40.2108 14.0664 40.2108 13.0332V3.02344H42.9655V19.116H40.2108V18.0918H39.7057C39.6503 18.1544 39.5956 18.2086 39.5403 18.2622C38.8513 18.8908 37.7952 19.116 36.7576 19.116C35.1321 19.116 33.5067 18.712 32.4416 17.5889C31.3766 16.4658 31 14.7403 31 13.0243C31 11.3083 31.3856 9.59177 32.4416 8.45971C33.5067 7.33658 35.1321 6.94097 36.7486 6.94097Z" fill="var(--dsw-alias-brand-primary)"></path><path d="M56.7855 12.8155V13.795H49.4483V11.8454H54.3152C54.2051 11.1358 53.9481 10.4709 53.4887 9.9853C52.8277 9.2846 51.808 9.03316 50.7983 9.03316C49.7886 9.03316 48.7688 9.2846 48.1078 9.9853C47.4468 10.686 47.2076 11.7555 47.2076 12.816C47.2076 13.8766 47.4462 14.9544 48.1078 15.6462C48.7688 16.338 49.788 16.5989 50.7983 16.5989C51.8085 16.5989 52.8277 16.3475 53.4887 15.6462C53.5804 15.5473 53.6631 15.4395 53.7458 15.3316H56.4642C56.2256 16.1765 55.849 16.9403 55.2796 17.5332C54.1777 18.692 52.479 19.1145 50.7983 19.1145C49.1175 19.1145 47.4188 18.701 46.3169 17.5332C45.215 16.3653 44.8111 14.5862 44.8111 12.816C44.8111 11.0458 45.2061 9.25778 46.3169 8.0989C47.4283 6.94001 49.1175 6.51758 50.7983 6.51758C52.479 6.51758 54.1777 6.93107 55.2796 8.0989C56.3904 9.26672 56.7855 11.0458 56.7855 12.816V12.8155Z" fill="var(--dsw-alias-brand-primary)"></path><path d="M70.6151 12.8155V13.795H63.2779V11.8454H68.1448C68.0341 11.1358 67.7776 10.4709 67.3183 9.9853C66.6573 9.2846 65.6376 9.03316 64.6279 9.03316C63.6182 9.03316 62.5984 9.2846 61.9374 9.9853C61.2764 10.686 61.0372 11.7555 61.0372 12.816C61.0372 13.8766 61.2758 14.9544 61.9374 15.6462C62.5984 16.338 63.6182 16.5989 64.6279 16.5989C65.6376 16.5989 66.6573 16.3475 67.3183 15.6462C67.4105 15.5473 67.4927 15.4395 67.5748 15.3316H70.2938C70.0546 16.1765 69.678 16.9403 69.1086 17.5332C68.0067 18.692 66.3081 19.1145 64.6279 19.1145C62.9476 19.1145 61.2484 18.701 60.1465 17.5332C59.0446 16.3653 58.6406 14.5862 58.6406 12.816C58.6406 11.0458 59.0357 9.25778 60.1465 8.0989C61.2579 6.94001 62.9471 6.51758 64.6279 6.51758C66.3086 6.51758 68.0067 6.93107 69.1086 8.0989C70.22 9.26672 70.6151 11.0458 70.6151 12.816V12.8155Z" fill="var(--dsw-alias-brand-primary)"></path><path d="M92.2781 19.1156C93.9589 19.1156 95.657 18.8731 96.7589 18.1813C97.8608 17.4896 98.2653 16.438 98.2653 15.3959C98.2653 14.3538 97.8697 13.2932 96.7589 12.6104C95.657 11.9276 93.9583 11.6756 92.2781 11.6756C91.5612 11.6756 90.9002 11.5767 90.4319 11.3163C89.9637 11.0464 89.7893 10.6424 89.7893 10.2379C89.7893 9.83332 89.9547 9.42039 90.4319 9.15944C90.9002 8.88955 91.626 8.80015 92.3418 8.80015C93.0576 8.80015 93.7834 8.89905 94.2528 9.15944C94.721 9.42933 94.8954 9.83332 94.8954 10.2379H97.6959C97.6959 9.1952 97.3383 8.13522 96.3376 7.4524C95.3368 6.76958 93.803 6.51758 92.2787 6.51758C90.7543 6.51758 89.2211 6.76008 88.2198 7.4524C87.219 8.14416 86.8603 9.1952 86.8603 10.2379C86.8603 11.2805 87.2185 12.3405 88.2198 13.0233C89.2205 13.7061 90.7538 13.9582 92.2787 13.9582C93.0682 13.9582 93.941 14.0571 94.464 14.3174C94.9881 14.5784 95.1714 14.9913 95.1714 15.3959C95.1714 15.8004 94.9881 16.2133 94.464 16.4743C93.941 16.7347 93.142 16.8336 92.3524 16.8336C91.5629 16.8336 90.7543 16.7347 90.2397 16.4743C89.7256 16.2139 89.5323 15.8004 89.5323 15.3959H86.2998C86.2998 16.4385 86.6943 17.4985 87.8063 18.1813C88.9171 18.8641 90.5979 19.1156 92.2787 19.1156H92.2781Z" fill="var(--dsw-alias-brand-primary)"></path><path d="M112.094 12.8155V13.795H104.757V11.8454H109.624C109.514 11.1358 109.257 10.4709 108.798 9.9853C108.136 9.2846 107.117 9.03316 106.106 9.03316C105.095 9.03316 104.077 9.2846 103.416 9.9853C102.755 10.686 102.517 11.7555 102.517 12.816C102.517 13.8766 102.755 14.9544 103.416 15.6462C104.077 16.338 105.097 16.5989 106.106 16.5989C107.116 16.5989 108.136 16.3475 108.798 15.6462C108.889 15.5473 108.972 15.4395 109.054 15.3316H111.772C111.533 16.1765 111.157 16.9403 110.588 17.5332C109.486 18.692 107.787 19.1145 106.106 19.1145C104.425 19.1145 102.727 18.701 101.625 17.5332C100.524 16.3653 100.12 14.5862 100.12 12.816C100.12 11.0458 100.515 9.25778 101.625 8.0989C102.737 6.94001 104.427 6.51758 106.106 6.51758C107.786 6.51758 109.486 6.93107 110.588 8.0989C111.699 9.26672 112.093 11.0458 112.093 12.816L112.094 12.8155Z" fill="var(--dsw-alias-brand-primary)"></path><path d="M125.924 12.8155V13.795H118.586V11.8454H123.453C123.344 11.1358 123.086 10.4709 122.627 9.9853C121.966 9.2846 120.947 9.03316 119.936 9.03316C118.926 9.03316 117.907 9.2846 117.246 9.9853C116.585 10.686 116.346 11.7555 116.346 12.816C116.346 13.8766 116.585 14.9544 117.246 15.6462C117.907 16.338 118.927 16.5989 119.936 16.5989C120.946 16.5989 121.966 16.3475 122.627 15.6462C122.719 15.5473 122.801 15.4395 122.885 15.3316H125.602C125.363 16.1765 124.987 16.9403 124.418 17.5332C123.316 18.692 121.617 19.1145 119.936 19.1145C118.256 19.1145 116.558 18.701 115.456 17.5332C114.354 16.3653 113.949 14.5862 113.949 12.816C113.949 11.0458 114.344 9.25778 115.456 8.0989C116.567 6.94001 118.256 6.51758 119.936 6.51758C121.617 6.51758 123.315 6.93107 124.418 8.0989C125.529 9.26672 125.924 11.0458 125.924 12.816V12.8155Z" fill="var(--dsw-alias-brand-primary)"></path><path d="M130.524 3.02344H127.77V19.116H130.524V3.02344Z" fill="var(--dsw-alias-brand-primary)"></path><path d="M135.227 12.4384L139.744 19.1146H136.337L131.819 12.4384L136.337 7.07422H139.744L135.227 12.4384Z" fill="var(--dsw-alias-brand-primary)"></path><g clip-path="url(#clip0_4329_19769)"><path d="M26.5174 3.39471C26.235 3.2567 26.1137 3.52006 25.9487 3.65346C25.8923 3.69659 25.8446 3.75294 25.7969 3.80469C25.3846 4.24516 24.9027 4.53439 24.2737 4.49989C23.3536 4.44814 22.5682 4.73737 21.8735 5.44119C21.7258 4.57349 21.2353 4.0554 20.4889 3.72304C20.0985 3.55054 19.7034 3.37746 19.4297 3.00197C19.2388 2.73459 19.1865 2.43673 19.091 2.14289C19.0301 1.96579 18.9697 1.78466 18.7656 1.75418C18.5442 1.71968 18.4574 1.90541 18.3705 2.06067C18.0232 2.69549 17.8887 3.39471 17.9019 4.10313C17.9324 5.6965 18.6051 6.96556 19.9421 7.86834C20.0939 7.97184 20.133 8.07535 20.0852 8.22658C19.9938 8.53766 19.8857 8.83955 19.7903 9.15063C19.7293 9.34901 19.6385 9.39271 19.4257 9.30588C18.692 8.9994 18.0583 8.54571 17.4982 7.99772C16.5477 7.07827 15.6881 6.06336 14.6162 5.26869C14.3644 5.08296 14.1125 4.91045 13.8521 4.746C12.7584 3.68394 13.9952 2.81164 14.2816 2.70814C14.5812 2.60003 14.3857 2.22857 13.4179 2.23317C12.4502 2.2372 11.5646 2.56151 10.4359 2.99335C10.2708 3.05832 10.0972 3.10547 9.91951 3.14457C8.8954 2.95022 7.83162 2.90709 6.72069 3.03245C4.62877 3.26533 2.95777 4.25436 1.72954 5.94261C0.254043 7.97184 -0.0932679 10.2777 0.33167 12.6824C0.778458 15.2171 2.07225 17.3153 4.06008 18.9558C6.12152 20.6567 8.49577 21.4905 11.2047 21.3306C12.8498 21.2358 14.6812 21.0155 16.7473 19.2669C17.2682 19.5262 17.8151 19.6297 18.7219 19.7074C19.4205 19.7724 20.0933 19.6729 20.6143 19.5648C21.4302 19.3923 21.3739 18.6367 21.0789 18.4981C18.6874 17.3843 19.2124 17.8374 18.7351 17.4706C19.9501 16.033 21.8063 13.4776 22.379 9.99821C22.4353 9.61409 22.5072 9.073 22.4986 8.76192C22.494 8.57216 22.5377 8.49856 22.7545 8.47671C23.3536 8.40771 23.935 8.24383 24.4692 7.94999C26.0188 7.10357 26.6439 5.71318 26.7911 4.04678C26.8129 3.79204 26.7865 3.52869 26.5174 3.39471ZM13.0143 18.3946C10.6964 16.5724 9.5722 15.9726 9.10816 15.9985C8.67402 16.0244 8.75222 16.5212 8.84768 16.8449C8.94773 17.1646 9.07768 17.3849 9.25996 17.6655C9.38589 17.8512 9.47272 18.1272 9.13404 18.3348C8.38766 18.7965 7.08985 18.1796 7.0289 18.1491C5.51833 17.2595 4.25559 16.0853 3.36546 14.4793C2.50581 12.9337 2.0067 11.2753 1.92447 9.50542C1.90262 9.07818 2.02855 8.92695 2.45406 8.84932C3.01413 8.74582 3.59144 8.72397 4.15093 8.80619C6.51656 9.15178 8.53027 10.2092 10.2185 11.8848C11.1822 12.8388 11.9114 13.979 12.6623 15.0929C13.461 16.2757 14.3201 17.4027 15.4144 18.3268C15.8008 18.6505 16.109 18.8966 16.404 19.0783C15.5144 19.1778 14.0297 19.1991 13.0143 18.3958V18.3946ZM14.1252 11.2489C14.1252 11.0591 14.277 10.9079 14.4679 10.9079C14.511 10.9079 14.5501 10.9165 14.5852 10.9292C14.6329 10.9464 14.6766 10.9723 14.7111 11.0114C14.7721 11.0718 14.8066 11.158 14.8066 11.2489C14.8066 11.4386 14.6548 11.5899 14.4639 11.5899C14.273 11.5899 14.1252 11.4386 14.1252 11.2489ZM17.5759 13.0188C17.3545 13.1096 17.1331 13.1873 16.9203 13.1959C16.5903 13.2131 16.2303 13.0791 16.0348 12.9153C15.7312 12.6605 15.5139 12.5179 15.423 12.0734C15.3839 11.8837 15.4057 11.5899 15.4402 11.4214C15.5185 11.0585 15.4316 10.8257 15.1757 10.614C14.9676 10.4415 14.7025 10.3938 14.4115 10.3938C14.3029 10.3938 14.2034 10.3461 14.1292 10.3076C14.0079 10.2472 13.9078 10.096 14.0033 9.91023C14.0338 9.84985 14.1815 9.70322 14.216 9.67734C14.6111 9.45251 15.0665 9.52612 15.488 9.6946C15.8784 9.85445 16.174 10.1477 16.5989 10.5623C17.033 11.0631 17.1112 11.2011 17.3585 11.5772C17.554 11.871 17.7317 12.1729 17.8536 12.5185C17.9272 12.7341 17.8317 12.9107 17.5759 13.0188Z" fill="var(--dsw-alias-brand-primary)"></path></g><defs><clipPath id="clip0_4329_19769"><rect width="26.634" height="19.6" fill="white" transform="translate(0.163086 1.75)"></rect></clipPath></defs></svg>',
+
+  fixLogo: function () {
+    if (location.hostname !== 'cdn.deepseek.com') return;
+    if (document.querySelector('[data-dse-logo]')) return;    // 已替换
+    // 按文本找应用名元素——类名是 bundle 哈希会变，页面自己的文本稳定
+    var el = null;
+    Array.prototype.forEach.call(document.querySelectorAll('div,span,a'), function (n) {
+      if (el || n.children.length) return;
+      if ((n.textContent || '').trim() !== 'API 使用 demo') return;
+      if (n.offsetParent === null) return;                    // 只要可见的那个
+      el = n;
+    });
+    if (!el) return;
+    el.textContent = '';
+    var host = document.createElement('span');
+    host.setAttribute('data-dse-logo', '1');
+    // 与官方一致：品牌色变量随标识自身携带；inline-flex + line-height:0 消除
+    // 行内 SVG 的基线间隙
+    host.style.cssText = '--dsw-alias-brand-primary:#5686fe;display:inline-flex;line-height:0;vertical-align:middle';
+    host.innerHTML = this.OFFICIAL_LOGO;
+    el.appendChild(host);
   },
 
   init: function () {
     var self = this;
     this.patchFetch();
+    this.fixFavicon();
     Utils.onReady(function () {
       self.injectUI();
-      // 弹窗是 React 组件，开合/切 tab 会重建 DOM——有弹窗时才补注入
+      self.fixLogo();      // 应用名可能还没被 React 渲染出来——下面的 observer 会补
+      // 弹窗是 React 组件，开合/切 tab 会重建 DOM——有弹窗时才补注入；
+      // 应用名被重绘恢复成文字时也靠这里补
       new MutationObserver(Utils.debounce(function () {
         if (document.querySelector('[class*="dialogMain-"]')) self.injectUI();
+        self.fixLogo();
       }, 300)).observe(document.body, { childList: true, subtree: true });
     });
+  },
+
+  // demo 页（cdn.deepseek.com/chat-demo）的 head 里没有任何 favicon 声明，
+  // 所在主机也没有 /favicon.ico（实测 404），浏览器只能显示默认空白图标。
+  // 官方主站声明的是 fe-static.deepseek.com/chat/favicon.svg（鲸鱼）——
+  // 照搬同一份官方资源，不自己画图标
+  fixFavicon: function () {
+    if (location.hostname !== 'cdn.deepseek.com') return;
+    if (document.querySelector('link[rel*="icon"]')) return;   // 页面自己有时不干预
+    var link = document.createElement('link');
+    link.rel = 'icon';
+    link.type = 'image/x-icon';
+    link.href = 'https://fe-static.deepseek.com/chat/favicon.svg';
+    (document.head || document.documentElement).appendChild(link);
   }
 };
 DSE.modules.demoApi = DemoApi;
+
+/* ===== modules/demosearch.js ===== */
+/* ============================================================
+ * modules/demosearch：chat-demo 会话搜索（一比一复刻官方主站）
+ *
+ * 背景：demo 页（cdn.deepseek.com/chat-demo）自身没有会话搜索——bundle 里
+ * 零搜索代码，左上角只有 Logo / 收起边栏 / 开启新对话。官方主站有：头部
+ * pill 第二个图标（放大镜）打开居中模态浮层，搜全部会话的消息内容。本模块
+ * 按官方实测规格复刻这套交互，数据源换成 demo 页本地 IndexedDB（官方是
+ * 服务端 SSE 搜云端；demo 的会话全在本地，无服务端可搜——这是唯一无法
+ * 同源的点）。
+ *
+ * 官方规格（2026-11-18 主站实测，暗/亮两主题；只抄数值与结构，不抄官方
+ * 的构建哈希类名）：
+ *   遮罩  全屏 fixed，bg rgba(0,0,0,.6)（亮 .36）+ backdrop-filter blur(2px)
+ *   表层  宽 660px、圆角 20px、暗 #2c2c2e / 亮 #fff、
+ *         阴影 0 2px 4px rgba(0,0,0,.04), 0 4px 10px rgba(0,0,0,.02)、
+ *         水平垂直居中、max-height calc(100vh - 202px)（内容超出则列表内滚）
+ *   搜索框 高 61px、padding 12px 12px 12px 8px、左 16px 放大镜（dim 色）、
+ *         输入框字号 16px（暗 #f9fafb / 亮 #0f1115）、右侧 × 关闭
+ *   结果项 左 40×40 气泡图标（20px，#81858c 双主题同值）；
+ *         标题 15px、日期 13px「M月D日」、多命中徽标 11px「n/m」均 dim 色；
+ *         摘要 13px（暗 #cfd3d6 / 亮 #61666b）、宽约 570px、单行 nowrap
+ *         截断、保留原始 markdown 不渲染、命中词同色加粗（font-weight 500）
+ *   选中/悬停行背景 暗 #353638 / 亮 #f1f3f5；空状态「暂无相关结果」
+ *   防抖 200ms（官方 conversation_search_debounce_ms 默认值）
+ *
+ * 数据源（demo 页 IndexedDB 实测）：库 chat-demo → store sessions，
+ * {id,title,createdAt,updatedAt,messages[]}；消息是 parentId/selectedChildId
+ * 树，user.content 为字符串，assistant 内容在 blocks[]——只取 type==='text'
+ * 的块（与官方可见结果一致，思考/工具块不搜）。
+ * 侧边栏顺序 = sessionSummaries 按 updatedAt 降序，与 store 逐位一一对应
+ * （唯一"差异"是空标题显示为「新对话」）——故点击结果按索引取侧边栏第 N
+ * 个条目即可打开正确会话，重复标题也不会开错。
+ *
+ * 与官方其余差异（如实记录）：结果排序官方按服务端相关度，本地按会话
+ * updatedAt 降序+会话内消息序；官方结果列表虚拟滚动，本地全量渲染（同量
+ * 级无性能差异）；官方标题命中结果的形态未取到样本，本地摘要取该会话首条
+ * 用户消息。
+ * ============================================================ */
+var DemoSearch = {
+  // 官方实测配色（暗/亮两组，取自官方设计令牌在两主题下的解析值）
+  PALETTE: {
+    dark: { surface: '#2c2c2e', text: '#f9fafb', snippet: '#cfd3d6', dim: '#adb2b8', hover: '#353638', mask: 'rgba(0,0,0,.6)' },
+    light: { surface: '#ffffff', text: '#0f1115', snippet: '#61666b', dim: '#81858c', hover: '#f1f3f5', mask: 'rgba(0,0,0,.36)' }
+  },
+  // 官方同款图标（从主站元素提取的原始 path，未改一个数值）
+  ICON_MAGNIFIER: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+    '<path d="M11.748 6.7028C11.748 3.90104 9.47653 1.62976 6.6748 1.62956C3.87291 1.62956 1.60156 3.90091 1.60156 6.7028C1.60176 9.50453 3.87304 11.776 6.6748 11.776C9.47641 11.7759 11.7479 9.50441 11.748 6.7028ZM13.0479 6.7028C13.0477 10.2224 10.1944 13.0757 6.6748 13.0759C3.15507 13.0759 0.300977 10.2225 0.300781 6.7028C0.300781 3.18294 3.15494 0.328781 6.6748 0.328781C10.1945 0.328977 13.0479 3.18307 13.0479 6.7028Z" fill="currentColor"/>' +
+    '<path d="M15.6991 14.7513L14.7792 15.6712L11.3974 12.2894L12.3173 11.3694L15.6991 14.7513Z" fill="currentColor"/></svg>',
+  ICON_CLOSE: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+    '<path d="M14.1871 13.1265L13.1265 14.1872L1.81275 2.87347L2.87341 1.81281L14.1871 13.1265" fill="currentColor"/>' +
+    '<path d="M13.1265 1.81282L14.1871 2.87348L2.8734 14.1872L1.81274 13.1265L13.1265 1.81282Z" fill="currentColor"/></svg>',
+  ICON_BUBBLE: '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M10 2C5.58162 2 2.00003 5.58162 2 10C2 11.2255 2.27557 12.3887 2.76953 13.4287L3.07422 14.0674L4.35059 13.4609L4.04785 12.8223L3.90332 12.4971C3.58796 11.7279 3.41406 10.8848 3.41406 10C3.41409 6.36278 6.36277 3.41407 10 3.41406C13.6372 3.41406 16.5859 6.36278 16.5859 10C16.5859 13.6372 13.6372 16.5859 10 16.5859C9.25515 16.5859 8.70984 16.5329 8.22656 16.3994C7.75059 16.2679 7.29925 16.0478 6.75879 15.6709C5.96644 15.1182 4.82978 14.9233 3.89355 15.5146L3.86426 15.5342L3.24121 15.9727L3.70996 17.3721L4.65918 16.7041C5.00017 16.4952 5.50572 16.5226 5.94824 16.8311C6.58879 17.2779 7.18624 17.5792 7.85059 17.7627C8.50781 17.9442 9.19541 18 10 18C14.4184 18 18 14.4184 18 10C18 5.58162 14.4184 2 10 2ZM6.25 10.5566V11.9707H10.1367V10.5566H6.25ZM6.25 9.23438H13.7852V7.82031H6.25V9.23438Z" fill="#81858C"/></svg>',
+  Z_INDEX: 2147483400,                 // 项目内阶梯：高于 toast(2147483000)，低于设置面板(2147483500)
+
+  active: function () { return location.hostname === 'cdn.deepseek.com'; },
+
+  init: function () {
+    if (!this.active()) return;
+    var self = this;
+    Utils.onReady(function () {
+      self.injectEntry();
+      // demo 头部会随侧边栏开合重绘——掉了就补（同 demoapi 的自愈模式）
+      new MutationObserver(Utils.debounce(function () {
+        if (!document.getElementById('dse-search-entry')) self.injectEntry();
+      }, 300)).observe(document.body, { childList: true, subtree: true });
+      // 主题切换：只更新根节点上的配色变量，已渲染条目自动跟随
+      Utils.onThemeChange(function () { self.paint(); });
+    });
+  },
+
+  /* ---------- 入口按钮（注入 demo 页左上角 Logo 行） ---------- */
+  // 位置：收起边栏按钮左侧。官方 pill 内顺序是[收起][搜索][新对话]，但 demo
+  // 侧边栏宽 261px、收起按钮已贴右缘（214–248），右侧放不下 34px——故放其
+  // 左侧，是唯一可行且不挤占官方元素的位置
+  injectEntry: function () {
+    var self = this;
+    if (!this.active() || document.getElementById('dse-search-entry')) return;
+    var top = document.querySelector('.top-ac14ac');
+    if (!top) return;
+    var collapse = Array.from(top.querySelectorAll('button'))
+      .find(b => (b.getAttribute('aria-label') || '') === '收起边栏');
+    if (!collapse) return;
+    // 尺寸/圆角/图标色对齐邻位按钮（实测照抄，不猜）
+    var cs = getComputedStyle(collapse);
+    var iconColor = cs.color;
+    var btn = document.createElement('button');
+    btn.id = 'dse-search-entry';
+    btn.type = 'button';
+    btn.title = DSE.t('搜索对话内容...');
+    btn.setAttribute('aria-label', DSE.t('搜索对话内容...'));
+    btn.style.cssText = 'box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;' +
+      'flex:0 0 auto;width:34px;height:34px;margin:0 2px;padding:0;border:none;outline:none;cursor:pointer;' +
+      'border-radius:' + (cs.borderRadius || '8px') + ';background:transparent;color:' + iconColor + ';' +
+      'transition:background .15s;opacity:.9';
+    btn.innerHTML = this.ICON_MAGNIFIER;
+    // 注意：事件处理器是普通函数，里面的 this 是按钮元素而非模块——必须用
+    // 顶部捕获的 self（本模块已在 demobridge 的 IIFE 上踩过同款坑）
+    btn.addEventListener('mouseenter', function () { btn.style.background = self.pal().hover; });
+    btn.addEventListener('mouseleave', function () { btn.style.background = 'transparent'; });
+    btn.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); self.open(); });
+    // 收起按钮裹在一个 trigger span 里，页面自带的 tooltip（"收起边栏"）就锚在
+    // 这个 span 上——按钮若插进 span，悬停它会弹出"收起边栏"（实测踩到）。
+    // 故插到 .top-ac14ac 下、排在 trigger span 之前：视觉上同样贴在收起按钮
+    // 左侧（span 是 display:contents，不改变布局），但不共享它的提示锚点
+    top.insertBefore(btn, collapse.parentElement);
+  },
+
+  pal: function () { return Utils.isDark() ? this.PALETTE.dark : this.PALETTE.light; },
+
+  /* ---------- 浮层（首次打开时构建，之后只切显隐） ---------- */
+  build: function () {
+    if (this.overlay) return;
+    var self = this;
+    var p = this.pal();
+
+    var overlay = document.createElement('div');
+    overlay.id = 'dse-search-mask';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:' + this.Z_INDEX + ';background:' + p.mask +
+      ';backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px)';
+    overlay.addEventListener('click', function () { self.close(); });
+
+    var surface = document.createElement('div');
+    surface.id = 'dse-search-modal';
+    surface.setAttribute('role', 'dialog');
+    // font-family:inherit——表单控件（input/button）默认不继承字体，会掉到
+    // Arial（实测），整层显式继承页面字体才与官方一致
+    surface.style.cssText = 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:' + (this.Z_INDEX + 1) +
+      ';width:660px;max-width:calc(100vw - 32px);max-height:calc(100vh - 202px);box-sizing:border-box;' +
+      'display:flex;flex-direction:column;overflow:hidden;border-radius:20px;background:' + p.surface +
+      ';box-shadow:rgba(0,0,0,.04) 0 2px 4px 0,rgba(0,0,0,.02) 0 4px 10px 0;font-family:inherit;line-height:inherit';
+
+    var box = document.createElement('div');
+    box.style.cssText = 'box-sizing:border-box;flex:0 0 auto;height:61px;display:flex;align-items:center;' +
+      'gap:8px;padding:12px 12px 12px 8px';
+    var ico = document.createElement('span');
+    ico.style.cssText = 'flex:0 0 auto;display:inline-flex;color:' + p.dim;
+    ico.innerHTML = this.ICON_MAGNIFIER;
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = DSE.t('搜索对话内容...');
+    // font-family/line-height:inherit——input 默认不继承（实测掉到 Arial），
+    // 必须显式继承页面字体才与官方浮层一致；官方输入框行高实测 24px
+    input.style.cssText = 'flex:1 1 auto;min-width:0;height:24px;border:none;outline:none;background:transparent;' +
+      'font-size:16px;font-family:inherit;line-height:24px;color:' + p.text;
+    input.addEventListener('input', Utils.debounce(function () { self.runSearch(input.value); }, 200));
+    var close = document.createElement('button');
+    close.type = 'button';
+    close.style.cssText = 'box-sizing:border-box;flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;' +
+      'width:34px;height:34px;border:none;outline:none;cursor:pointer;border-radius:8px;background:transparent;color:' + p.dim;
+    close.innerHTML = this.ICON_CLOSE;
+    close.addEventListener('click', function () { self.close(); });
+    box.appendChild(ico); box.appendChild(input); box.appendChild(close);
+
+    var list = document.createElement('div');
+    list.id = 'dse-search-list';
+    // 官方实测：滚动容器无 padding，其内层 items 容器 padding 8px 8px 0
+    list.style.cssText = 'box-sizing:border-box;flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;' +
+      'padding:8px 8px 0';
+
+    surface.appendChild(box); surface.appendChild(list);
+    overlay.appendChild(surface);
+    document.body.appendChild(overlay);
+
+    this.overlay = overlay; this.surface = surface; this.input = input; this.list = list;
+    // Esc 关闭（打开期间常驻，关闭后不拦键）
+    this._onKey = function (e) { if (e.key === 'Escape') self.close(); };
+  },
+
+  paint: function () {
+    if (!this.overlay) return;
+    var p = this.pal();
+    this.overlay.style.background = p.mask;
+    this.surface.style.background = p.surface;
+    this.input.style.color = p.text;
+    this.list.querySelectorAll('[data-dse-s-text]').forEach(function (el) { el.style.color = p.text; });
+    this.list.querySelectorAll('[data-dse-s-dim]').forEach(function (el) { el.style.color = p.dim; });
+    this.list.querySelectorAll('[data-dse-s-snippet]').forEach(function (el) { el.style.color = p.snippet; });
+  },
+
+  open: function () {
+    this.build();
+    this.overlay.style.display = 'block';
+    this.paint();
+    this.input.value = '';
+    this.list.innerHTML = '';
+    this.input.focus();
+    document.addEventListener('keydown', this._onKey, true);
+  },
+
+  close: function () {
+    if (!this.overlay) return;
+    this.overlay.style.display = 'none';
+    document.removeEventListener('keydown', this._onKey, true);
+  },
+
+  /* ---------- 数据：读本地会话，沿活跃消息链收集可搜文本 ---------- */
+  readSessions: function () {
+    return new Promise(function (resolve) {
+      var rq;
+      try { rq = indexedDB.open('chat-demo'); } catch (e) { return resolve([]); }
+      rq.onerror = function () { resolve([]); };
+      rq.onsuccess = function () {
+        var db = rq.result;
+        var getAll;
+        try { getAll = db.transaction('sessions', 'readonly').objectStore('sessions').getAll(); }
+        catch (e) { db.close(); return resolve([]); }
+        getAll.onsuccess = function () { resolve(getAll.result || []); db.close(); };
+        getAll.onerror = function () { resolve([]); db.close(); };
+      };
+    });
+  },
+
+  // 沿 selectedChildId 走当前分支（与页面自身读取逻辑一致）
+  chain: function (session) {
+    var byId = {}, msgs = session.messages || [], i;
+    for (i = 0; i < msgs.length; i++) byId[msgs[i].id] = msgs[i];
+    var root = null;
+    for (i = 0; i < msgs.length; i++) if (msgs[i].parentId == null) { root = msgs[i]; break; }
+    if (!root) root = msgs[0];
+    var out = [], cur = root, guard = 0;
+    while (cur && guard++ < 500) { out.push(cur); cur = cur.selectedChildId ? byId[cur.selectedChildId] : null; }
+    return out;
+  },
+
+  // 一条消息的可搜文本：user=content 字符串；assistant=text 块拼接
+  // （thinking/工具块不搜——官方可见结果同样只有正文）
+  msgText: function (m) {
+    if (!m) return '';
+    if (m.role === 'user') return typeof m.content === 'string' ? m.content : '';
+    return (m.blocks || []).filter(function (b) { return b.type === 'text'; })
+      .map(function (b) { return b.text || ''; }).join('\n');
+  },
+
+  runSearch: async function (q) {
+    q = String(q || '').trim();
+    if (!q) { this.list.innerHTML = ''; return; }
+    var sessions = await this.readSessions();
+    // 与侧边栏同序：updatedAt 降序（索引即侧边栏条目位置）
+    sessions.sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
+    var ql = q.toLowerCase(), self = this, results = [];
+    sessions.forEach(function (s, idx) {
+      var title = (s.title || '').trim();
+      var titleHit = title && title.toLowerCase().indexOf(ql) !== -1;
+      var hits = [];
+      self.chain(s).forEach(function (m) {
+        var t = self.msgText(m);
+        if (t && t.toLowerCase().indexOf(ql) !== -1) hits.push({ role: m.role, text: t });
+      });
+      // 标题命中：摘要取该会话首条用户消息（官方此形态未取到样本）
+      if (titleHit && !hits.length) {
+        var firstUser = '';
+        self.chain(s).some(function (m) { if (m.role === 'user') { firstUser = self.msgText(m); return true; } return false; });
+        hits.push({ role: 'user', text: firstUser });
+      }
+      hits.forEach(function (h, i) {
+        results.push({ idx: idx, title: title, updatedAt: s.updatedAt || 0, text: h.text, n: i + 1, m: hits.length });
+      });
+    });
+    this.render(q, results);
+  },
+
+  /* ---------- 渲染 ---------- */
+  // 摘要：命中词前后各取约 60 字，前缀/后缀省略号；原文转义不渲染 markdown；
+  // 命中词同色加粗（官方实测：无背景色，仅 font-weight 500）
+  snippet: function (text, q) {
+    var t = String(text || '');
+    var i = t.toLowerCase().indexOf(q.toLowerCase());
+    if (i < 0) i = 0;
+    var s = Math.max(0, i - 60), e = Math.min(t.length, i + q.length + 60);
+    var pre = (s > 0 ? '…' : '') + t.slice(s, i);
+    var hit = t.slice(i, i + q.length);
+    var post = t.slice(i + q.length, e) + (e < t.length ? '…' : '');
+    return Utils.escHtml(pre) + '<span data-dse-s-hit style="font-weight:500">' + Utils.escHtml(hit) + '</span>' + Utils.escHtml(post);
+  },
+
+  fmtDate: function (ts) {
+    var d = new Date(ts);
+    return (d.getMonth() + 1) + '月' + d.getDate() + '日';
+  },
+
+  render: function (q, results) {
+    var self = this, p = this.pal();
+    this.list.innerHTML = '';
+    if (!results.length) {
+      var empty = document.createElement('div');
+      empty.style.cssText = 'box-sizing:border-box;padding:24px 16px;text-align:center;font-size:13px;color:' + p.dim;
+      empty.textContent = DSE.t('暂无相关结果');
+      this.list.appendChild(empty);
+      return;
+    }
+    results.forEach(function (r) {
+      var item = document.createElement('div');
+      item.setAttribute('role', 'option');
+      // 官方实测：flex/center/gap 12、padding 10 12 10 10、圆角 16
+      item.style.cssText = 'box-sizing:border-box;display:flex;align-items:center;gap:12px;' +
+        'padding:10px 12px 10px 10px;border-radius:16px;cursor:pointer;flex:0 0 auto';
+      item.addEventListener('mouseenter', function () { item.style.background = self.pal().hover; });
+      item.addEventListener('mouseleave', function () { item.style.background = 'transparent'; });
+      item.addEventListener('click', function () { self.openSession(r.idx); });
+
+      var ico = document.createElement('span');
+      ico.style.cssText = 'flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:40px;height:40px';
+      ico.innerHTML = this.ICON_BUBBLE;
+
+      var body = document.createElement('div');
+      body.style.cssText = 'flex:1 1 0px;min-width:0';
+      // 官方实测：标题行 flex/center/gap 12；标题行高 25、日期/徽标行高 20
+      var head = document.createElement('div');
+      head.style.cssText = 'display:flex;align-items:center;gap:12px;min-width:0';
+      var title = document.createElement('span');
+      title.setAttribute('data-dse-s-text', '1');
+      title.style.cssText = 'flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
+        'font-size:15px;line-height:25px;color:' + p.text;
+      title.textContent = r.title || DSE.t('新对话');
+      var date = document.createElement('span');
+      date.setAttribute('data-dse-s-dim', '1');
+      date.style.cssText = 'flex:0 0 auto;font-size:13px;line-height:20px;color:' + p.dim;
+      date.textContent = this.fmtDate(r.updatedAt);
+      head.appendChild(title); head.appendChild(date);
+      // 多命中会话显示「n/m」（官方实测：11px、dim 色、紧跟日期）
+      if (r.m > 1) {
+        var badge = document.createElement('span');
+        badge.setAttribute('data-dse-s-dim', '1');
+        badge.style.cssText = 'flex:0 0 auto;font-size:11px;line-height:20px;color:' + p.dim;
+        badge.textContent = r.n + '/' + r.m;
+        head.appendChild(badge);
+      }
+      var snip = document.createElement('div');
+      snip.setAttribute('data-dse-s-snippet', '1');
+      snip.style.cssText = 'margin-top:2px;font-size:13px;line-height:20px;color:' + p.snippet +
+        ';white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+      snip.innerHTML = this.snippet(r.text, q);
+      body.appendChild(head); body.appendChild(snip);
+
+      item.appendChild(ico); item.appendChild(body);
+      this.list.appendChild(item);
+    }.bind(this));
+  },
+
+  /* ---------- 打开会话（按索引点侧边栏对应条目） ---------- */
+  // 侧边栏顺序 = sessionSummaries 按 updatedAt 降序，与搜索结果同序——
+  // 第 idx 个条目就是要找的会话（重复标题也不会开错）
+  openSession: function (idx) {
+    this.close();
+    var items = document.querySelectorAll('.item-ff6fc9');
+    var el = items[idx];
+    if (!el) return;
+    Utils.realClick(el);
+  }
+};
+DSE.modules.demoSearch = DemoSearch;
+
+/* ===== modules/demobridge.js ===== */
+/* ============================================================
+ * modules/demobridge：chat-demo 换模型时的「原生工具桥接」
+ *
+ * 背景：demo 把端点/模型写死（api.deepseek.com + deepseek-flash），工具
+ * （deepseek_web_search / deepseek_read_url）是 DeepSeek 服务端工具，
+ * 与模型调用同在一个请求里。换成第三方端点后，第三方不认这些私有工具
+ * 类型——于是把工具执行拆成「客户端工具循环」：
+ *
+ *   1. 出站改写（打第三方端点）：剥 DeepSeek 私有字段（tools/safety_check/
+ *      title/thinking）、latest_reminder 私有角色折叠进 system、声明标准
+ *      客户端工具（web_search/read_url）、system 追加工具使用规程；
+ *   2. 第三方模型吐 tool_use → 用一次【极小请求】打 DeepSeek 官方端点
+ *      （thinking enabled + 原生双工具声明，无历史无 system）→ DeepSeek
+ *      后端原生执行深度搜索/读网页 → 原样剥出 server_tool_use /
+ *      web_search_tool_result / web_fetch_tool_result / thinking 块；
+ *   3. 这些块【原样转发】给 demo（id 天然满足 demo 的 id===tool_use_id
+ *      硬约束，呈现 100% 原生）；腿产出的调研报告浓缩成 tool_result
+ *      喂回第三方模型；
+ *   4. 循环至模型不再调工具，合成 message_delta/message_stop
+ *      收尾；最终轮文本实时流式转发（保原生打字机效果）；
+ *   5. 会话起名：demo 官方行为是请求带 title:{enabled:true}、服务端在
+ *      message_delta 里回 delta.title——第三方端点没这个能力，由起名腿补上
+ *      （与主回答并行，见 runTitleLeg / runTitleLegModel）。来源可配
+ *      （demoTitleSource）：deepseek=官方端点起名腿 / model=自定义模型
+ *      提示词起名 / off=首条消息截断
+ *
+ * 实测依据（2026-11-17 三份全链路追踪）：
+ *  - 极小请求完整复现原生深度搜索（11 次工具调用/50 结果/9 全文页）；
+ *  - 原生历史自清洗（工具块不进后续请求）→ 本模块不做历史清洗；
+ *  - demo 解析器规范见 modules/think.js 注释与 docs/dom-research.md。
+ *
+ * 端点=DeepSeek（含未配端点）时本模块不激活，走 demoapi 原样透传。
+ * ============================================================ */
+var DemoBridge = {
+  LEG_TIMEOUT: 60000,
+  LEG_TEXT_CAP: 6000,          // 喂回模型的腿报告上限（字符）
+  DS_LEG_BASE: 'https://api.deepseek.com/anthropic/v1',
+
+  // 自定义模型起名的系统提示词（source=model）。规则式写法参照 OpenWebUI
+  // 默认标题模板与 Claude Code /rename：短、准确、跟随语言、只输出 JSON
+  TITLE_SYSTEM_PROMPT: '你是会话标题生成器。根据用户给出的对话首条消息，生成一个简洁的会话标题。\n' +
+    '规则：\n' +
+    '- 不超过 12 个汉字或 6 个英文单词\n' +
+    '- 准确概括主题，优先准确而非创意\n' +
+    '- 使用该消息本身的语言\n' +
+    '- 不要引号、书名号、emoji、句末标点\n' +
+    '- 只输出一个 JSON 对象，不要任何解释：{"title":"标题"}',
+
+  /* ---------- 激活判定 ---------- */
+  active: function () {
+    if (!DSE.config.get('demoCustom')) return false;   // 总开关关闭 = 完全官方逻辑
+    var ep = (DSE.config.get('demoEndpoint') || '').trim();
+    if (!ep) return false;
+    if (/deepseek\.com/i.test(ep)) return false;    // 官方端点 → 原生透传（工具原生工作）
+    var mode = DSE.config.get('demoBridge') || 'auto';
+    return mode !== 'off';
+  },
+
+  // 原生 fetch（未经 demoapi 补丁）——桥接的出站请求（第三方端点 + DeepSeek 腿）
+  // 必须走它，否则腿的 URL 会被 demoapi 的补丁改写成第三方端点
+  nativeFetch: function () {
+    return (DSE.modules.demoApi && DSE.modules.demoApi._origFetch) || window.fetch;
+  },
+
+  keyHeader: function (headers) {
+    var style = DSE.config.get('demoKeyHeader') || 'x-api-key';
+    var key = (DSE.config.get('demoKey') || '').trim();
+    if (!key) return headers;                       // 未覆盖 Key 时用 demo 原样头
+    var h = {};
+    for (var k in headers) if (Object.prototype.hasOwnProperty.call(headers, k)) h[k] = headers[k];
+    delete h['x-api-key']; delete h['Authorization']; delete h['authorization'];
+    if (style === 'authorization') h['Authorization'] = 'Bearer ' + key;
+    else h['x-api-key'] = key;
+    return h;
+  },
+
+  /* ---------- 出站请求构造（第三方端点） ---------- */
+  buildOutbound: function (body, origHeaders) {
+    var messages = [];
+    var reminder = '';
+    (body.messages || []).forEach(function (m) {
+      if (m.role === 'latest_reminder') { reminder = typeof m.content === 'string' ? m.content : ''; return; }
+      messages.push(m);
+    });
+    var system = typeof body.system === 'string' ? body.system : '';
+    // 系统提示词：只删掉官方内置的 DeepSeek 自述（"该助手为DeepSeek，由深度
+    // 求索公司创造。"）——换第三方模型时保留它，模型会在思维链里引用该句并
+    // 自称 DeepSeek（2026-11-17 实测）。仅删除，不替换成任何自造人设；
+    // 官方端点不走桥接，不受影响
+    system = system.replace(/该助手为DeepSeek[^。]*。?/g, '').trim();
+    if (reminder) {
+      var p = reminder.split(',');
+      system += '\n\n当前时间：' + (p[0] || '') + ' ' + (p[1] || '') + '；语言：' + (p[4] || '中文') + '；平台：' + (p[3] || 'Web') + '。';
+    }
+    system += '\n\n你可以使用 web_search / read_url 工具获取实时信息，结果会以 tool_result 返回。' +
+      '需要最新或外部信息时必须调用工具，不要凭空回答。同一轮回答中 web_search 不超过 2 次，尽量一次搜准。' +
+      '调用工具前不要输出面向用户的文本。';
+    var searchApiMode = (DSE.config.get('demoToolMode') || 'native') === 'searchapi';
+    var tools = [
+      { name: 'web_search', description: '搜索网页获取实时信息。需要最新/外部信息时必须调用。',
+        input_schema: { type: 'object', properties: { query: { type: 'string', description: '搜索查询词' } }, required: ['query'] } }
+    ];
+    // read_url 两种模式都声明：native 走模型对话内的读网页工具；searchapi
+    // 直调独立 Fetch API（/v1/tools/fetch）
+    tools.push({ name: 'read_url', description: '读取指定网页全文。需要某网页详细内容时调用。',
+      input_schema: { type: 'object', properties: { url: { type: 'string', description: '网页 URL' } }, required: ['url'] } });
+    var out = {
+      model: (DSE.config.get('demoModel') || '').trim() || body.model,
+      max_tokens: 8192,
+      stream: true,
+      system: system,
+      messages: messages,
+      tools: tools
+    };
+    return { url: this.normUrl((DSE.config.get('demoEndpoint') || '').trim()), headers: this.keyHeader(origHeaders), body: out };
+  },
+
+  // 端点 URL 归一：与 demoapi.patchFetch 同一套逻辑——配置可以带或不带
+  // /messages（界面说明是不带），两种填法都归一成完整接口地址。此前
+  // buildOutbound 直接用配置原值，不带 /messages 时会 404（只因历史配置
+  // 带了后缀才没暴露）
+  normUrl: function (ep) {
+    ep = String(ep || '').replace(/\/+$/, '');
+    if (!ep) return '';
+    return /\/messages$/.test(ep) ? ep : ep + '/messages';
+  },
+
+  /* ---------- SSE 工具 ---------- */
+  sseEvent: function (type, obj) {
+    return 'event: ' + type + '\ndata: ' + JSON.stringify(obj) + '\n\n';
+  },
+
+  // 通用 SSE 读取器：逐事件回调；返回累积的块/usage/stop_reason
+  pump: function (stream, onEvent, signal) {
+    var reader = stream.getReader();
+    var dec = new TextDecoder();
+    var buf = '';
+    return (async function () {
+      while (true) {
+        if (signal && signal.aborted) { try { reader.cancel(); } catch (e) {} throw new DOMException('Aborted', 'AbortError'); }
+        var r = await reader.read();
+        if (r.done) break;
+        buf += dec.decode(r.value, { stream: true });
+        var idx;
+        while ((idx = buf.indexOf('\n\n')) !== -1) {
+          var ev = buf.slice(0, idx); buf = buf.slice(idx + 2);
+          var data = null;
+          var lines = ev.split('\n');
+          for (var i = 0; i < lines.length; i++) if (lines[i].indexOf('data: ') === 0) data = lines[i].slice(6);
+          if (!data) continue;
+          var j = null;
+          try { j = JSON.parse(data); } catch (e) { continue; }
+          if (j.type === 'error' || (j.error && j.error.message)) throw new Error((j.error && j.error.message) || 'stream error');
+          onEvent(j);
+        }
+      }
+    })();
+  },
+
+  /* ---------- DeepSeek 极小搜索腿 ---------- */
+  // 返回 {blocks:[...原生工具/思考块...], text:腿的报告, usage}
+  /* ---------- DeepSeek 独立搜索腿（searchapi 模式：只付搜索费） ---------- */
+  // 直调 POST https://api.deepseek.com/v1/tools/search（Bearer 鉴权，用页面里
+  // 同一把 DeepSeek Key），不发起模型对话——没有模型 token 费，只按次计搜索
+  // 费（$0.75/1000 次，空结果不计费）。结果按 demo 解析器规范合成原生形状的
+  // server_tool_use / web_search_tool_result 块转发，界面呈现与 native 一致
+  runLegSearchApi: function (toolName, toolInput, dsKey, push, nextIdx, signal) {
+    var self = this;
+    var isRead = toolName === 'read_url';
+    var q = isRead ? String((toolInput || {}).url || '') : String((toolInput || {}).query || '').slice(0, 128);
+    if (!q) return Promise.reject(new Error('empty input'));
+    var ac = new AbortController();
+    var timer = setTimeout(function () { ac.abort(); }, 20000);
+    if (signal) signal.addEventListener('abort', function () { ac.abort(); }, { once: true });
+    var url = isRead ? 'https://api.deepseek.com/v1/tools/fetch' : 'https://api.deepseek.com/v1/tools/search';
+    var reqBody = isRead ? { url: q } : { query: q, count: 10, need_content: false };
+    return this.nativeFetch()(url, {
+      method: 'POST', signal: ac.signal,
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + dsKey },
+      body: JSON.stringify(reqBody)
+    }).then(function (resp) {
+      clearTimeout(timer);
+      if (!resp.ok) throw new Error((isRead ? 'fetch' : 'search') + ' api http ' + resp.status);
+      return resp.json();
+    }).then(function (j) {
+      var id = 'srvtoolu_sa_' + Math.random().toString(36).slice(2, 10);
+      var i1 = nextIdx(), i2 = nextIdx();
+      var toolResultText;
+      if (isRead) {
+        // 读网页：open_page 动作块 + web_fetch_tool_result（content 为单对象）
+        var title = (j && j.title) || q;
+        var content = (j && j.content) || '';
+        push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i1,
+          content_block: { type: 'server_tool_use', id: id, name: 'deepseek_read_url', kind: 'read_link',
+            input: { action: 'open_page', url: q } } }));
+        push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i1 }));
+        push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i2,
+          content_block: { type: 'web_fetch_tool_result', tool_use_id: id, kind: 'read_link',
+            content: { type: 'web_fetch_result', url: q, content: { title: title }, published_at: '' } } }));
+        push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i2 }));
+        toolResultText = (title ? title + '\n' : '') + String(content).slice(0, self.LEG_TEXT_CAP);
+      } else {
+        var results = (j && j.results) || [];
+        push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i1,
+          content_block: { type: 'server_tool_use', id: id, name: 'deepseek_web_search', kind: 'search',
+            input: { action: 'search', queries: [q] } } }));
+        push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i1 }));
+        push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i2,
+          content_block: { type: 'web_search_tool_result', tool_use_id: id, kind: 'search',
+            content: results.slice(0, 10).map(function (r) {
+              return { type: 'web_search_result', title: r.title || '', url: r.url || '',
+                snippet: r.snippet || r.summary || '', site_name: r.site_name || '',
+                site_icon: r.site_icon || '', page_age: r.date || '' };
+            }) } }));
+        push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i2 }));
+        toolResultText = results.slice(0, 10).map(function (r, i) {
+          return (i + 1) + '. ' + (r.title || '') + '\n' + (r.url || '') + '\n' + (r.snippet || r.summary || '');
+        }).join('\n\n') || '（未搜索到结果）';
+      }
+      return { text: toolResultText };
+    }).catch(function (e) {
+      clearTimeout(timer);
+      throw e;
+    });
+  },
+
+  /* ---------- 极小起名腿（补官方页的 title:{enabled:true} 通道） ---------- */
+  // demo 页官方行为：请求带 title:{enabled:true}（仅会话还没标题时），服务端
+  // 在同一次流式响应的 message_delta 里回 delta.title，侧边栏直接采用。第三方
+  // 端点不认这个字段、不会回标题——故桥接补一条极小 DeepSeek 腿：同样的
+  // title:{enabled:true} + 首条用户消息打官方端点，把服务端生成的标题按官方
+  // 同一条通道（message_delta.delta.title）转发给 demo。成本约 55 in/16 out
+  // token（≈$0.001）；腿与主回答并行发起，延迟被主回答掩盖。失败时退回首条
+  // 消息截断（桥接此前行为）
+  runTitleLeg: function (firstUser, dsKey, signal) {
+    var self = this;
+    var ac = new AbortController();
+    var timer = setTimeout(function () { ac.abort(); }, 15000);
+    if (signal) signal.addEventListener('abort', function () { ac.abort(); }, { once: true });
+    var title = '';
+    var body = {
+      model: 'deepseek-flash', stream: true, max_tokens: 32,
+      system: '该助手为DeepSeek，由深度求索公司创造。',
+      messages: [{ role: 'user', content: String(firstUser).replace(/\s+/g, ' ').trim().slice(0, 500) }],
+      title: { enabled: true }
+    };
+    return this.nativeFetch()(this.DS_LEG_BASE + '/messages', {
+      method: 'POST', signal: ac.signal,
+      headers: { 'Content-Type': 'application/json', 'x-api-key': dsKey, 'Accept': 'text/event-stream' },
+      body: JSON.stringify(body)
+    }).then(function (resp) {
+      if (!resp.ok) throw new Error('title leg http ' + resp.status);
+      return self.pump(resp.body, function (j) {
+        if (j.type === 'message_delta' && j.delta && j.delta.title) title = String(j.delta.title).trim();
+      }, ac.signal);
+    }).then(function () {
+      clearTimeout(timer);
+      return title.slice(0, 30);
+    }).catch(function (e) {
+      clearTimeout(timer);
+      throw e;
+    });
+  },
+
+  /* ---------- 起名来源（demoTitleSource） ---------- */
+  // deepseek=起名腿打 DeepSeek 官方端点（title 参数，官方通道，约 $0.001/次）
+  // model=当前自定义模型按提示词起名（费用走第三方端点，不经 DeepSeek）
+  // off=不起名，退回首条消息截断
+  titleSource: function () {
+    var s = DSE.config.get('demoTitleSource');
+    return (s === 'model' || s === 'off') ? s : 'deepseek';
+  },
+
+  // 自定义模型起名的输出清洗（LibreChat sanitizeTitle 同思路）：
+  // 第三方模型不保证干净输出——推理模型可能把 <think> 吐进正文、可能包引号/
+  // 代码围栏/寒暄。链路：剥思考 → 优先取 JSON 里的 title（围栏不挡匹配，
+  // 顺序不能反）→ 没有 JSON 时按行挑（扔围栏、丢寒暄前缀与过长行）→ 去
+  // 首尾包裹符号与句末标点 → 码点安全截断 → 空则返回 ''（交由上层兜底）
+  cleanTitle: function (raw) {
+    var t = String(raw || '').replace(/<think>[\s\S]*?<\/think>/gi, '');
+    var m = t.match(/"title"\s*:\s*"([^"]{1,60})"/);
+    if (m) {
+      t = m[1];
+    } else {
+      var j = t.match(/\{[\s\S]*\}/);
+      if (j) { try { var o = JSON.parse(j[0]); if (o && o.title) t = String(o.title); } catch (e) {} }
+      if (!m) {
+        t = t.replace(/```[\s\S]*?```/g, ' ');
+        var lines = t.split('\n').map(function (l) { return l.trim(); }).filter(Boolean);
+        var pick = '';
+        for (var i = 0; i < lines.length; i++) {
+          var l = lines[i];
+          if (/^(当然|好的|以下是|这是|根据|希望|标题|如下|为你)/.test(l)) continue;  // 寒暄前缀
+          if (Array.from(l).length > 24) continue;                                   // 标题不会这么长
+          pick = l; break;
+        }
+        t = pick || lines[0] || '';
+      }
+    }
+    t = t.replace(/^["'`“”‘’「『\[\(【〔{]+/, '').replace(/["'`“”‘’」』\]\)】〕}.。.，,！!？?；;：:\s]+$/, '').trim();
+    var cps = Array.from(t);
+    if (cps.length > 30) t = cps.slice(0, 30).join('') + '…';
+    return t.trim();
+  },
+
+  /* ---------- 极小起名腿：自定义模型（提示词起名） ---------- */
+  // source=model 时用当前第三方端点起名：非流式单发。两个实测约束：
+  // ① max_tokens 不能小——StepFun 实测 <256 返 HTTP 200 但 content 空串
+  //    （见 stepfun-api-gotchas）；② step-5-preview 实测忽略
+  //    thinking:{disabled}（响应仍只回 thinking 块），256 预算会被思考全吃光、
+  //    文本块轮不到（stop_reason=max_tokens）→ 故取 1024（与设置里测试按钮
+  //    同款，实测思考+文本都放得下）。URL/headers 复用主出站（已按
+  //    demoKeyHeader 处理过 Key），不另起配置。与主回答并行发起，延迟被掩盖；
+  //    失败/空结果退回首条消息截断。费用走第三方端点，不产生 DeepSeek 模型费
+  runTitleLegModel: function (firstUser, outbound, signal) {
+    var self = this;
+    var ac = new AbortController();
+    var timer = setTimeout(function () { ac.abort(); }, 15000);
+    if (signal) signal.addEventListener('abort', function () { ac.abort(); }, { once: true });
+    var body = {
+      model: outbound.body.model,
+      max_tokens: 1024,
+      stream: false,
+      thinking: { type: 'disabled' },
+      system: this.TITLE_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: String(firstUser).replace(/\s+/g, ' ').trim().slice(0, 500) }]
+    };
+    return this.nativeFetch()(outbound.url, {
+      method: 'POST', signal: ac.signal,
+      headers: Object.assign({ 'Content-Type': 'application/json', 'Accept': 'application/json' }, outbound.headers),
+      body: JSON.stringify(body)
+    }).then(function (resp) {
+      if (!resp.ok) throw new Error('title(model) http ' + resp.status);
+      return resp.json();
+    }).then(function (j) {
+      clearTimeout(timer);
+      var txt = (j.content || []).filter(function (b) { return b.type === 'text'; })
+        .map(function (b) { return b.text || ''; }).join('');
+      return self.cleanTitle(txt);
+    }).catch(function (e) {
+      clearTimeout(timer);
+      throw e;
+    });
+  },
+
+  runLeg: function (toolName, toolInput, dsKey, push, nextIdx, signal) {
+    if ((DSE.config.get('demoToolMode') || 'native') === 'searchapi') {
+      return this.runLegSearchApi(toolName, toolInput, dsKey, push, nextIdx, signal);
+    }
+    var self = this;
+    var q = toolName === 'read_url' ? ('请读取并详细总结这个网页的内容：' + (toolInput.url || ''))
+                                    : ('请深入调研以下问题，搜索并阅读相关网页，然后给出有据可查的结论：\n' + (toolInput.query || ''));
+    var tools = toolName === 'read_url'
+      ? [{ name: 'deepseek_read_url', type: 'deepseek_read_url' }]
+      : [{ name: 'deepseek_read_url', type: 'deepseek_read_url' }, { name: 'deepseek_web_search', type: 'deepseek_web_search' }];
+    var body = { model: 'deepseek-flash', stream: true, thinking: { type: 'enabled' }, max_tokens: 4096, tools: tools, messages: [{ role: 'user', content: q }] };
+    var ac = new AbortController();
+    var timer = setTimeout(function () { ac.abort(); }, this.LEG_TIMEOUT);
+    if (signal) signal.addEventListener('abort', function () { ac.abort(); }, { once: true });
+    return this.nativeFetch()(this.DS_LEG_BASE + '/messages', {
+      method: 'POST', signal: ac.signal,
+      headers: { 'Content-Type': 'application/json', 'x-api-key': dsKey, 'Accept': 'text/event-stream' },
+      body: JSON.stringify(body)
+    }).then(function (resp) {
+      if (!resp.ok) return resp.text().then(function (t) { throw new Error('leg http ' + resp.status + ': ' + t.slice(0, 200)); });
+      var out = { blocks: [], text: '', usage: null };
+      return self.pump(resp.body, function (j) {
+        if (j.type === 'content_block_start') {
+          var cb = j.content_block || {};
+          var b = { index: nextIdx(), raw: cb, fwd: false };
+          out.blocks.push(b);
+          // 工具块与思考块原样转发 demo（id/kind/tool_use_id 保持腿内原值）；
+          // 腿的报告文本不转发——它走 tool_result 喂回模型
+          if (cb.type === 'server_tool_use' || cb.type === 'web_search_tool_result' ||
+              cb.type === 'web_fetch_tool_result' || cb.type === 'thinking') {
+            b.fwd = true;
+            push(self.sseEvent('content_block_start', { type: 'content_block_start', index: b.index, content_block: cb }));
+          }
+        } else if (j.type === 'content_block_delta') {
+          var d = j.delta || {};
+          var blk = out.blocks[out.blocks.length - 1];
+          if (blk && blk.fwd && (d.type === 'thinking_delta' || d.type === 'signature_delta')) {
+            push(self.sseEvent('content_block_delta', { type: 'content_block_delta', index: blk.index, delta: d }));
+          }
+          if (blk && blk.raw.type === 'text' && d.type === 'text_delta') out.text += d.text || '';
+        } else if (j.type === 'content_block_stop') {
+          var b2 = out.blocks[out.blocks.length - 1];
+          if (b2 && b2.fwd) push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: b2.index }));
+        } else if (j.type === 'message_delta') {
+          out.usage = j.usage || out.usage;
+        }
+      }, ac.signal).then(function () { clearTimeout(timer); return out; });
+    }).catch(function (e) {
+      clearTimeout(timer);
+      throw e;
+    });
+  },
+
+  /* ---------- 主流程 ---------- */
+  intercept: function (url, init, dsKey) {
+    var self = this;
+    var body = null;
+    try { body = JSON.parse(init.body); } catch (e) { return null; }
+    if (!body || !body.messages) return null;
+
+    var outbound = this.buildOutbound(body, init.headers || {});
+    var enc = new TextEncoder();
+    var q = [], done = false, wake = null;
+    var push = function (s) { q.push(s); if (wake) { var w = wake; wake = null; w(); } };
+    var finish = function () { done = true; if (wake) { var w = wake; wake = null; w(); } };
+    var ac = new AbortController();
+    if (init.signal) init.signal.addEventListener('abort', function () { ac.abort(); }, { once: true });
+
+    var stream = new ReadableStream({
+      pull: function (c) {
+        if (q.length) { c.enqueue(enc.encode(q.shift())); return; }
+        if (done) { c.close(); return; }
+        return new Promise(function (r) { wake = r; });
+      },
+      cancel: function () { ac.abort(); }
+    });
+
+    (async function () {
+      var idx = 0;
+      var nextIdx = function () { return idx++; };
+      var usage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
+      var addUsage = function (u) {
+        if (!u) return;
+        ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'].forEach(function (k) {
+          if (typeof u[k] === 'number') usage[k] += u[k];
+        });
+      };
+      var wantTitle = !!(body.title && body.title.enabled);
+      // 起名腿与主回答并行发起（标题只需首条用户消息，不必等回答完）——
+      // 官方端点上标题由服务端在同一次请求里顺手生成，第三方端点没这个
+      // 能力，用一条极小腿补上，延迟被主回答掩盖掉。来源由 demoTitleSource
+      // 决定：deepseek=官方端点 title 参数腿；model=自定义模型提示词腿；
+      // off=不起腿（收尾处退回首条消息截断）。
+      // 注意：本闭包是无接收者调用的 async IIFE（bootstrap 还有 'use strict'），
+      // 里面的 this 不是 DemoBridge（严格模式下为 undefined）——必须用函数顶部
+      // 捕获的 self，否则 this.titleSource 直接 TypeError；且该段在下方 try 之前，
+      // 异常会变成 unhandled rejection，表现为流既不推数据也不发请求、页面永远
+      // 挂在"停止生成"（本次开发实测踩到）
+      var titleSrc = self.titleSource();
+      var titleLeg = null;
+      if (wantTitle && titleSrc !== 'off') {
+        var firstUser0 = '';
+        for (var fi = 0; fi < (body.messages || []).length; fi++) {
+          var fm = body.messages[fi];
+          if (fm && fm.role === 'user' && typeof fm.content === 'string') { firstUser0 = fm.content; break; }
+        }
+        if (firstUser0) {
+          titleLeg = (titleSrc === 'model'
+            ? self.runTitleLegModel(firstUser0, outbound, ac.signal)
+            : self.runTitleLeg(firstUser0, dsKey, ac.signal)
+          ).catch(function () { return ''; });
+        }
+      }
+      try {
+        push(self.sseEvent('message_start', {
+          type: 'message_start',
+          message: { id: 'msg_bridge_' + Math.random().toString(36).slice(2, 10), type: 'message', role: 'assistant',
+            model: outbound.body.model, content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }
+        }));
+        // 工具循环：与原生行为一致——模型持续调用工具就持续供给结果，
+        // 直到它自己停止调用（给出最终文本回答）。不设轮数上限、不加
+        // 无进展检测之类的认为中断；需要停止时用页面自身的停止按钮
+        // （abort 经 signal 传到在途请求，流关闭，demo 显示“已停止”）
+        var messages = outbound.body.messages.slice();
+        var stopReason = 'end_turn';
+        while (true) {
+          var resp = await self.nativeFetch()(outbound.url, {
+            method: 'POST', signal: ac.signal,
+            headers: Object.assign({ 'Content-Type': 'application/json', 'Accept': 'text/event-stream' }, outbound.headers),
+            body: JSON.stringify(Object.assign({}, outbound.body, { messages: messages }))
+          });
+          if (!resp.ok) {
+            var et = await resp.text().catch(function () { return ''; });
+            var em = et; try { var ej = JSON.parse(et); em = (ej.error && ej.error.message) || et; } catch (e) {}
+            push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: '模型端点错误 ' + resp.status + '：' + String(em).slice(0, 200) } }));
+            finish(); return;
+          }
+          var blocks = [];       // 本轮完整块（供下一轮历史）
+          var partial = {};      // index → 累积 input_json
+          var roundUsage = null, roundStop = 'end_turn', respModel = '';
+          await self.pump(resp.body, function (j) {
+            if (j.type === 'message_start' && j.message && j.message.model) respModel = j.message.model;
+            if (j.type === 'content_block_start') {
+              var cb = j.content_block || {};
+              var b = { type: cb.type, raw: cb, index: nextIdx() };
+              blocks.push(b); partial[b.index] = '';
+              if (cb.type === 'text' || cb.type === 'thinking' || cb.type === 'tool_use') {
+                push(self.sseEvent('content_block_start', { type: 'content_block_start', index: b.index, content_block: cb }));
+              }
+            } else if (j.type === 'content_block_delta') {
+              var d = j.delta || {};
+              var blk = blocks[blocks.length - 1];
+              if (!blk) return;
+              if (d.type === 'input_json_delta') { partial[blk.index] += d.partial_json || ''; return; }
+              if (d.type === 'text_delta' || d.type === 'thinking_delta' || d.type === 'signature_delta') {
+                if (blk.type === 'tool_use') return;
+                push(self.sseEvent('content_block_delta', { type: 'content_block_delta', index: blk.index, delta: d }));
+              }
+            } else if (j.type === 'content_block_stop') {
+              var b2 = blocks[blocks.length - 1];
+              if (b2) {
+                if (b2.type === 'tool_use') {
+                  try { b2.raw.input = JSON.parse(partial[b2.index] || '{}'); } catch (e) { b2.raw.input = {}; }
+                }
+                push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: b2.index }));
+              }
+            } else if (j.type === 'message_delta') {
+              roundUsage = j.usage || roundUsage;
+              if (j.delta && j.delta.stop_reason) roundStop = j.delta.stop_reason;
+            }
+          }, ac.signal);
+          addUsage(roundUsage);
+          var toolUses = blocks.filter(function (b) { return b.type === 'tool_use'; });
+          if (roundStop !== 'tool_use' || !toolUses.length) { stopReason = roundStop; break; }
+          // 有工具调用 → 逐个跑 DeepSeek 原生腿
+          var results = [];
+          for (var ti = 0; ti < toolUses.length; ti++) {
+            var tu = toolUses[ti];
+            var leg;
+            try {
+              leg = await self.runLeg(tu.raw.name, tu.raw.input || {}, dsKey, push, nextIdx, ac.signal);
+              addUsage(leg.usage);
+            } catch (le) {
+              // 腿失败 → 原生失败形状的搜索块 + 空结果喂回
+              var fidx = nextIdx();
+              push(self.sseEvent('content_block_start', { type: 'content_block_start', index: fidx,
+                content_block: { type: 'server_tool_use', id: 'srvtoolu_b_' + Math.random().toString(36).slice(2, 8), name: 'deepseek_web_search', input: { action: 'search', queries: [String((tu.raw.input || {}).query || '').slice(0, 80)] }, kind: 'search' } }));
+              push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: fidx }));
+              var ridx = nextIdx();
+              push(self.sseEvent('content_block_start', { type: 'content_block_start', index: ridx,
+                content_block: { type: 'web_search_tool_result', tool_use_id: 'srvtoolu_b_x', kind: 'search', content: [{ type: 'web_search_tool_result_error', error_code: 'search_unavailable' }] } }));
+              push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: ridx }));
+              leg = { text: '（搜索失败：' + String(le && le.message || le).slice(0, 120) + '）' };
+            }
+            results.push({ type: 'tool_result', tool_use_id: tu.raw.id, content: String(leg.text || '').slice(0, self.LEG_TEXT_CAP) || '（无结果）' });
+          }
+          // 历史追加：assistant 原样 + user tool_result（tool_result 在前，无文本）
+          messages = messages.concat([
+            { role: 'assistant', content: blocks.map(function (b) { return b.raw; }) },
+            { role: 'user', content: results }
+          ]);
+        }
+        // 精确上下文占用：最后一轮响应的 usage（input + cache_read + cache_creation）
+        // ——即本次请求模型实际收到的全部内容（系统/工具/历史），非估算
+        if (roundUsage) {
+          var uIn = roundUsage.input_tokens || 0;
+          var uCacheRead = roundUsage.cache_read_input_tokens || 0;
+          var uCacheCreate = roundUsage.cache_creation_input_tokens || 0;
+          var used = uIn + uCacheRead + uCacheCreate;
+          if (used > 0) {
+            // 构成估算：请求是我们构造的，系统/工具/消息三块的 token 占比可算
+            // （精确总量来自 usage；占比为估算，面板内已标注）
+            var estSys = Utils.estimateTokens(outbound.body.system || '');
+            var estTool = Utils.estimateTokens(JSON.stringify(outbound.body.tools || []));
+            var estMsg = Utils.estimateTokens(JSON.stringify(messages));
+            DSE.emit('ctx:api', {
+              used: used, input: uIn, cacheRead: uCacheRead, cacheCreate: uCacheCreate,
+              estSys: estSys, estTool: estTool, estMsg: estMsg,
+              model: respModel || outbound.body.model || ''
+            });
+          }
+        }
+        // 收尾
+        var sr = (stopReason === 'end_turn' || stopReason === 'max_tokens' || stopReason === 'refusal') ? stopReason : 'end_turn';
+        var delta = { stop_reason: sr, stop_sequence: null };
+        if (wantTitle) {
+          // 优先起名腿拿到的标题（deepseek 源是服务端生成的官方同款；model
+          // 源是自定义模型输出、已过 cleanTitle 清洗）；腿关闭/失败时退回首条
+          // 消息截断——桥接此前行为
+          var title = '';
+          if (titleLeg) { try { title = (await titleLeg) || ''; } catch (e) { title = ''; } }
+          if (!title) {
+            for (var mi = 0; mi < messages.length; mi++) {
+              if (messages[mi].role === 'user' && typeof messages[mi].content === 'string') {
+                title = messages[mi].content.replace(/\s+/g, ' ').trim().slice(0, 20); break;
+              }
+            }
+          }
+          if (title) delta.title = title;
+        }
+        push(self.sseEvent('message_delta', { type: 'message_delta', delta: delta, usage: usage }));
+        push(self.sseEvent('message_stop', { type: 'message_stop' }));
+      } catch (e) {
+        if (e && e.name === 'AbortError') { finish(); return; }
+        push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: String(e && e.message || e).slice(0, 200) } }));
+      }
+      finish();
+    })();
+
+    return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache' } });
+  }
+};
+DSE.modules.demoBridge = DemoBridge;
+
+/* ===== modules/ctxring.js ===== */
+/* ============================================================
+ * modules/ctxring：自定义模型时的上下文占用圆圈（ZCode 式精简环）
+ *
+ * 数据来源：demobridge 在每次交换结束后从响应 usage 算出精确占用
+ * （input + cache_read + cache_creation = 本次请求模型实际收到的全部
+ * 内容：系统提示/工具定义/完整历史——非文本估算），经 'ctx:api' 事件
+ * 广播。本模块只负责把占用/窗口画成一个环，注入在输入工具条里、
+ * 发送按钮一侧；仅在开启自定义模型且已产生一次交换后出现。
+ * ============================================================ */
+var CtxRing = {
+  SIZE: 22, R: 8.5,
+
+  limit: function () {
+    var v = parseInt(DSE.config.get('demoCtxLimit'), 10);
+    return (v > 0) ? v : 128000;
+  },
+
+  fmt: function (n) {
+    if (n >= 1000000) return (n / 1000000).toFixed(n >= 10000000 ? 0 : 1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'K';
+    return String(n);
+  },
+
+  inject: function () {
+    var mods = DSE.modules.buttons;
+    var bar = mods && mods.findToolbar ? mods.findToolbar() : null;
+    if (!bar || document.getElementById('dse-ctx-ring')) return;
+    var C = 2 * Math.PI * this.R;
+    var btn = document.createElement('button');
+    btn.id = 'dse-ctx-ring';
+    btn.type = 'button';
+    // 不用 .dse-icon-btn（display!important 会压住内联隐藏）；也不给按钮加
+    // 圆形边框/底色——那会和里面的 SVG 进度环叠成“两个圈”（UI 瑕疵），
+    // 保持只有一个环
+    btn.style.cssText = 'display:none;align-items:center;justify-content:center;width:24px;height:24px;' +
+      'border:none;background:transparent;cursor:pointer;flex:0 0 auto;padding:0;margin:0 6px;' +
+      'transition:opacity .15s;opacity:.8';
+    btn.title = '';
+    btn.innerHTML =
+      '<svg width="' + this.SIZE + '" height="' + this.SIZE + '" viewBox="0 0 ' + this.SIZE + ' ' + this.SIZE + '">' +
+      '<circle cx="11" cy="11" r="' + this.R + '" fill="none" stroke="var(--dse-border)" stroke-width="2.5"></circle>' +
+      '<circle class="dse-ctx-arc" cx="11" cy="11" r="' + this.R + '" fill="none" stroke="var(--dse-accent)" ' +
+      'stroke-width="2.5" stroke-linecap="round" stroke-dasharray="' + C.toFixed(2) + '" stroke-dashoffset="' + C.toFixed(2) + '" ' +
+      'transform="rotate(-90 11 11)"></circle></svg>';
+    btn.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); });
+    // 位置：发送按钮左侧（ZCode 式：环挨着发送区）。发送按钮可能嵌在中间层
+    // （如 right-xxx 容器），先向上找到属于 bar 的直接子级再插
+    var sendBtn = bar.querySelector('[class*="sendButton"]');
+    var ref = sendBtn;
+    while (ref && ref.parentElement && ref.parentElement !== bar) ref = ref.parentElement;
+    if (ref && ref.parentElement === bar) bar.insertBefore(btn, ref);
+    else bar.appendChild(btn);
+    return btn;
+  },
+
+  update: function (data) {
+    var self = this;   // 必须在方法内捕获——裸 self 会解析到浏览器全局 window.self
+    var used = data && data.used ? data.used : data;
+    this._last = used;
+    this._data = (data && data.used) ? data : { used: used, input: used, cacheRead: 0, cacheCreate: 0, estSys: 0, estTool: 0, estMsg: used };
+    var btn = document.getElementById('dse-ctx-ring') || this.inject();
+    if (!btn) return;
+    var limit = this.limit();
+    var pct = Math.max(0, Math.min(100, used / limit * 100));
+    var arc = btn.querySelector('.dse-ctx-arc');
+    var C = 2 * Math.PI * this.R;
+    if (arc) arc.setAttribute('stroke-dashoffset', (C * (1 - pct / 100)).toFixed(2));
+    // 颜色分级：>90% 危险 / >70% 警告（与设置面板的 ctx 分级一致）
+    arc.setAttribute('stroke', pct >= 90 ? '#f87171' : (pct >= 70 ? '#fbbf24' : 'var(--dse-accent)'));
+    btn.style.display = DSE.config.get('demoCustom') ? 'inline-flex' : 'none';
+    // 富信息悬浮面板替代原生 title
+    btn.onmouseenter = function () { self.showPanel(); };
+    btn.onmouseleave = function () { self.hidePanel(); };
+    btn.onfocus = function () { self.showPanel(); };
+    btn.onblur = function () { self.hidePanel(); };
+  },
+
+  /* ---------- 悬浮详情面板（ZCode 式：总量+进度条+构成+缓存命中率） ---------- */
+  ensurePanel: function () {
+    if (document.getElementById('dse-ctx-panel')) return document.getElementById('dse-ctx-panel');
+    var p = document.createElement('div');
+    p.id = 'dse-ctx-panel';
+    p.style.cssText = 'position:fixed;z-index:99999;display:none;width:264px;box-sizing:border-box;' +
+      'border-radius:14px;padding:14px 16px;font-size:12px;line-height:1.6;' +
+      'box-shadow:0 12px 40px rgba(0,0,0,.35);backdrop-filter:blur(20px) saturate(160%);' +
+      '-webkit-backdrop-filter:blur(20px) saturate(160%);pointer-events:none;';
+    document.body.appendChild(p);
+    return p;
+  },
+
+  paintPanel: function () {
+    var d = this._data;
+    var p = this.ensurePanel();
+    if (!d) { p.style.display = 'none'; return; }
+    var dark = document.body.classList.contains('dark');
+    var bg = dark ? 'rgba(38,40,48,.92)' : 'rgba(255,255,255,.94)';
+    var fg = dark ? '#e8eaef' : '#1d2129';
+    var dim = dark ? 'rgba(232,234,239,.55)' : 'rgba(29,33,41,.55)';
+    var line = dark ? 'rgba(255,255,255,.1)' : 'rgba(0,0,0,.08)';
+    p.style.background = bg; p.style.color = fg;
+    p.style.border = '1px solid ' + line;
+    var limit = this.limit();
+    var pct = Math.max(0, Math.min(100, d.used / limit * 100));
+    // 构成占比（估算，归一到 100%）
+    var estSum = Math.max(1, d.estSys + d.estTool + d.estMsg);
+    var rows = [
+      [DSE.t('消息'), d.estMsg],
+      [DSE.t('系统提示词'), d.estSys],
+      [DSE.t('系统工具'), d.estTool]
+    ];
+    var hit = (d.input + d.cacheRead + d.cacheCreate) > 0
+      ? Math.round(d.cacheRead / (d.input + d.cacheRead + d.cacheCreate) * 1000) / 10 : 0;
+    var html = '';
+    // 标题行：左“上下文容量”，右当前模型名（响应里回的 model，权威）
+    var modelName = d.model || (DSE.config.get('demoModel') || '').trim();
+    html += '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px">' +
+      '<span style="font-size:13px;font-weight:600">' + DSE.t('上下文容量') + '</span>' +
+      (modelName ? '<span style="font-size:11px;opacity:.55;font-weight:400;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + Utils.escHtml(modelName) + '">' + Utils.escHtml(modelName) + '</span>' : '') +
+      '</div>';
+    html += '<div style="font-size:15px;font-weight:600;margin-bottom:8px">' + this.fmt(d.used) + '/' + this.fmt(limit) +
+      '<span style="font-weight:400;font-size:12px;opacity:.75">（' + pct.toFixed(pct >= 10 ? 1 : 1) + '%）</span></div>';
+    html += '<div style="height:6px;border-radius:3px;background:' + line + ';overflow:hidden;margin-bottom:10px">' +
+      '<div style="height:100%;width:' + pct + '%;border-radius:3px;background:' +
+      (pct >= 90 ? '#f87171' : (pct >= 70 ? '#fbbf24' : 'var(--dse-accent)')) + '"></div></div>';
+    rows.forEach(function (r) {
+      var pctRow = Math.round(r[1] / estSum * 1000) / 10;
+      html += '<div style="display:flex;justify-content:space-between;padding:1px 0">' +
+        '<span style="color:' + dim + '">' + r[0] + '</span><span>' + pctRow.toFixed(1) + '%</span></div>';
+    });
+    html += '<div style="border-top:1px solid ' + line + ';margin:8px 0 6px"></div>';
+    html += '<div style="display:flex;justify-content:space-between"><span style="color:' + dim + '">' +
+      DSE.t('平均缓存命中率') + '</span><span>' + hit.toFixed(1) + '%</span></div>';
+    html += '<div style="color:' + dim + ';font-size:11px;margin-top:6px">' +
+      DSE.t('总量与缓存命中率为接口 usage 精确值；构成占比按请求结构估算') + '</div>';
+    p.innerHTML = html;
+  },
+
+  showPanel: function () {
+    var p = this.ensurePanel();
+    var btn = document.getElementById('dse-ctx-ring');
+    if (!btn || !this._data) return;
+    this.paintPanel();
+    p.style.display = 'block';
+    var r = btn.getBoundingClientRect();
+    var ph = p.offsetHeight, pw = p.offsetWidth;
+    var left = Math.max(8, Math.min(window.innerWidth - pw - 8, r.left + r.width / 2 - pw / 2));
+    var top = r.top - ph - 8;
+    if (top < 8) top = r.bottom + 8;
+    p.style.left = left + 'px';
+    p.style.top = top + 'px';
+  },
+
+  hidePanel: function () {
+    var p = document.getElementById('dse-ctx-panel');
+    if (p) p.style.display = 'none';
+  },
+
+  init: function () {
+    var self = this;
+    Utils.onReady(function () {
+      self.inject();
+      DSE.on('ctx:api', function (p) { if (p && p.used > 0) self.update(p); });
+      // 总开关关闭时隐藏；窗口配置变更时按新上限重画
+      DSE.on('cfg:change', function (e) {
+        if (e.path === 'demoCustom' && !e.value) {
+          var b = document.getElementById('dse-ctx-ring');
+          if (b) b.style.display = 'none';
+          self.hidePanel();
+        }
+        if (e.path === 'demoCtxLimit' && self._data) { self.update(self._data); self.hidePanel(); }
+      });
+      // 工具条会随会话切换重建——保持圆圈在场
+      new MutationObserver(Utils.debounce(function () {
+        if (document.getElementById('dse-ctx-ring')) return;
+        self.inject();
+        // 用 _data（完整对象）重画——传 _last（数字）会走 update 的兜底分支，
+        // 把构成估算数据清零
+        if (self._data) self.update(self._data);
+      }, 400)).observe(document.body, { childList: true, subtree: true });
+    });
+  }
+};
+DSE.modules.ctxRing = CtxRing;
 
 /* ===== settings/panel.js ===== */
 /* ============================================================
@@ -2903,6 +4411,9 @@ DSE.modules.panel = Panel;
     'zoom',
     'buttons',
     'demoApi',
+    'demoSearch',
+    'demoBridge',
+    'ctxRing',
     'panel'
   ];
   function boot() {

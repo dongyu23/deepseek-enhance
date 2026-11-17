@@ -1,0 +1,598 @@
+/* ============================================================
+ * modules/demobridge：chat-demo 换模型时的「原生工具桥接」
+ *
+ * 背景：demo 把端点/模型写死（api.deepseek.com + deepseek-flash），工具
+ * （deepseek_web_search / deepseek_read_url）是 DeepSeek 服务端工具，
+ * 与模型调用同在一个请求里。换成第三方端点后，第三方不认这些私有工具
+ * 类型——于是把工具执行拆成「客户端工具循环」：
+ *
+ *   1. 出站改写（打第三方端点）：剥 DeepSeek 私有字段（tools/safety_check/
+ *      title/thinking）、latest_reminder 私有角色折叠进 system、声明标准
+ *      客户端工具（web_search/read_url）、system 追加工具使用规程；
+ *   2. 第三方模型吐 tool_use → 用一次【极小请求】打 DeepSeek 官方端点
+ *      （thinking enabled + 原生双工具声明，无历史无 system）→ DeepSeek
+ *      后端原生执行深度搜索/读网页 → 原样剥出 server_tool_use /
+ *      web_search_tool_result / web_fetch_tool_result / thinking 块；
+ *   3. 这些块【原样转发】给 demo（id 天然满足 demo 的 id===tool_use_id
+ *      硬约束，呈现 100% 原生）；腿产出的调研报告浓缩成 tool_result
+ *      喂回第三方模型；
+ *   4. 循环至模型不再调工具，合成 message_delta/message_stop
+ *      收尾；最终轮文本实时流式转发（保原生打字机效果）；
+ *   5. 会话起名：demo 官方行为是请求带 title:{enabled:true}、服务端在
+ *      message_delta 里回 delta.title——第三方端点没这个能力，由起名腿补上
+ *      （与主回答并行，见 runTitleLeg / runTitleLegModel）。来源可配
+ *      （demoTitleSource）：deepseek=官方端点起名腿 / model=自定义模型
+ *      提示词起名 / off=首条消息截断
+ *
+ * 实测依据（2026-11-17 三份全链路追踪）：
+ *  - 极小请求完整复现原生深度搜索（11 次工具调用/50 结果/9 全文页）；
+ *  - 原生历史自清洗（工具块不进后续请求）→ 本模块不做历史清洗；
+ *  - demo 解析器规范见 modules/think.js 注释与 docs/dom-research.md。
+ *
+ * 端点=DeepSeek（含未配端点）时本模块不激活，走 demoapi 原样透传。
+ * ============================================================ */
+var DemoBridge = {
+  LEG_TIMEOUT: 60000,
+  LEG_TEXT_CAP: 6000,          // 喂回模型的腿报告上限（字符）
+  DS_LEG_BASE: 'https://api.deepseek.com/anthropic/v1',
+
+  // 自定义模型起名的系统提示词（source=model）。规则式写法参照 OpenWebUI
+  // 默认标题模板与 Claude Code /rename：短、准确、跟随语言、只输出 JSON
+  TITLE_SYSTEM_PROMPT: '你是会话标题生成器。根据用户给出的对话首条消息，生成一个简洁的会话标题。\n' +
+    '规则：\n' +
+    '- 不超过 12 个汉字或 6 个英文单词\n' +
+    '- 准确概括主题，优先准确而非创意\n' +
+    '- 使用该消息本身的语言\n' +
+    '- 不要引号、书名号、emoji、句末标点\n' +
+    '- 只输出一个 JSON 对象，不要任何解释：{"title":"标题"}',
+
+  /* ---------- 激活判定 ---------- */
+  active: function () {
+    if (!DSE.config.get('demoCustom')) return false;   // 总开关关闭 = 完全官方逻辑
+    var ep = (DSE.config.get('demoEndpoint') || '').trim();
+    if (!ep) return false;
+    if (/deepseek\.com/i.test(ep)) return false;    // 官方端点 → 原生透传（工具原生工作）
+    var mode = DSE.config.get('demoBridge') || 'auto';
+    return mode !== 'off';
+  },
+
+  // 原生 fetch（未经 demoapi 补丁）——桥接的出站请求（第三方端点 + DeepSeek 腿）
+  // 必须走它，否则腿的 URL 会被 demoapi 的补丁改写成第三方端点
+  nativeFetch: function () {
+    return (DSE.modules.demoApi && DSE.modules.demoApi._origFetch) || window.fetch;
+  },
+
+  keyHeader: function (headers) {
+    var style = DSE.config.get('demoKeyHeader') || 'x-api-key';
+    var key = (DSE.config.get('demoKey') || '').trim();
+    if (!key) return headers;                       // 未覆盖 Key 时用 demo 原样头
+    var h = {};
+    for (var k in headers) if (Object.prototype.hasOwnProperty.call(headers, k)) h[k] = headers[k];
+    delete h['x-api-key']; delete h['Authorization']; delete h['authorization'];
+    if (style === 'authorization') h['Authorization'] = 'Bearer ' + key;
+    else h['x-api-key'] = key;
+    return h;
+  },
+
+  /* ---------- 出站请求构造（第三方端点） ---------- */
+  buildOutbound: function (body, origHeaders) {
+    var messages = [];
+    var reminder = '';
+    (body.messages || []).forEach(function (m) {
+      if (m.role === 'latest_reminder') { reminder = typeof m.content === 'string' ? m.content : ''; return; }
+      messages.push(m);
+    });
+    var system = typeof body.system === 'string' ? body.system : '';
+    // 系统提示词：只删掉官方内置的 DeepSeek 自述（"该助手为DeepSeek，由深度
+    // 求索公司创造。"）——换第三方模型时保留它，模型会在思维链里引用该句并
+    // 自称 DeepSeek（2026-11-17 实测）。仅删除，不替换成任何自造人设；
+    // 官方端点不走桥接，不受影响
+    system = system.replace(/该助手为DeepSeek[^。]*。?/g, '').trim();
+    if (reminder) {
+      var p = reminder.split(',');
+      system += '\n\n当前时间：' + (p[0] || '') + ' ' + (p[1] || '') + '；语言：' + (p[4] || '中文') + '；平台：' + (p[3] || 'Web') + '。';
+    }
+    system += '\n\n你可以使用 web_search / read_url 工具获取实时信息，结果会以 tool_result 返回。' +
+      '需要最新或外部信息时必须调用工具，不要凭空回答。同一轮回答中 web_search 不超过 2 次，尽量一次搜准。' +
+      '调用工具前不要输出面向用户的文本。';
+    var searchApiMode = (DSE.config.get('demoToolMode') || 'native') === 'searchapi';
+    var tools = [
+      { name: 'web_search', description: '搜索网页获取实时信息。需要最新/外部信息时必须调用。',
+        input_schema: { type: 'object', properties: { query: { type: 'string', description: '搜索查询词' } }, required: ['query'] } }
+    ];
+    // read_url 两种模式都声明：native 走模型对话内的读网页工具；searchapi
+    // 直调独立 Fetch API（/v1/tools/fetch）
+    tools.push({ name: 'read_url', description: '读取指定网页全文。需要某网页详细内容时调用。',
+      input_schema: { type: 'object', properties: { url: { type: 'string', description: '网页 URL' } }, required: ['url'] } });
+    var out = {
+      model: (DSE.config.get('demoModel') || '').trim() || body.model,
+      max_tokens: 8192,
+      stream: true,
+      system: system,
+      messages: messages,
+      tools: tools
+    };
+    return { url: this.normUrl((DSE.config.get('demoEndpoint') || '').trim()), headers: this.keyHeader(origHeaders), body: out };
+  },
+
+  // 端点 URL 归一：与 demoapi.patchFetch 同一套逻辑——配置可以带或不带
+  // /messages（界面说明是不带），两种填法都归一成完整接口地址。此前
+  // buildOutbound 直接用配置原值，不带 /messages 时会 404（只因历史配置
+  // 带了后缀才没暴露）
+  normUrl: function (ep) {
+    ep = String(ep || '').replace(/\/+$/, '');
+    if (!ep) return '';
+    return /\/messages$/.test(ep) ? ep : ep + '/messages';
+  },
+
+  /* ---------- SSE 工具 ---------- */
+  sseEvent: function (type, obj) {
+    return 'event: ' + type + '\ndata: ' + JSON.stringify(obj) + '\n\n';
+  },
+
+  // 通用 SSE 读取器：逐事件回调；返回累积的块/usage/stop_reason
+  pump: function (stream, onEvent, signal) {
+    var reader = stream.getReader();
+    var dec = new TextDecoder();
+    var buf = '';
+    return (async function () {
+      while (true) {
+        if (signal && signal.aborted) { try { reader.cancel(); } catch (e) {} throw new DOMException('Aborted', 'AbortError'); }
+        var r = await reader.read();
+        if (r.done) break;
+        buf += dec.decode(r.value, { stream: true });
+        var idx;
+        while ((idx = buf.indexOf('\n\n')) !== -1) {
+          var ev = buf.slice(0, idx); buf = buf.slice(idx + 2);
+          var data = null;
+          var lines = ev.split('\n');
+          for (var i = 0; i < lines.length; i++) if (lines[i].indexOf('data: ') === 0) data = lines[i].slice(6);
+          if (!data) continue;
+          var j = null;
+          try { j = JSON.parse(data); } catch (e) { continue; }
+          if (j.type === 'error' || (j.error && j.error.message)) throw new Error((j.error && j.error.message) || 'stream error');
+          onEvent(j);
+        }
+      }
+    })();
+  },
+
+  /* ---------- DeepSeek 极小搜索腿 ---------- */
+  // 返回 {blocks:[...原生工具/思考块...], text:腿的报告, usage}
+  /* ---------- DeepSeek 独立搜索腿（searchapi 模式：只付搜索费） ---------- */
+  // 直调 POST https://api.deepseek.com/v1/tools/search（Bearer 鉴权，用页面里
+  // 同一把 DeepSeek Key），不发起模型对话——没有模型 token 费，只按次计搜索
+  // 费（$0.75/1000 次，空结果不计费）。结果按 demo 解析器规范合成原生形状的
+  // server_tool_use / web_search_tool_result 块转发，界面呈现与 native 一致
+  runLegSearchApi: function (toolName, toolInput, dsKey, push, nextIdx, signal) {
+    var self = this;
+    var isRead = toolName === 'read_url';
+    var q = isRead ? String((toolInput || {}).url || '') : String((toolInput || {}).query || '').slice(0, 128);
+    if (!q) return Promise.reject(new Error('empty input'));
+    var ac = new AbortController();
+    var timer = setTimeout(function () { ac.abort(); }, 20000);
+    if (signal) signal.addEventListener('abort', function () { ac.abort(); }, { once: true });
+    var url = isRead ? 'https://api.deepseek.com/v1/tools/fetch' : 'https://api.deepseek.com/v1/tools/search';
+    var reqBody = isRead ? { url: q } : { query: q, count: 10, need_content: false };
+    return this.nativeFetch()(url, {
+      method: 'POST', signal: ac.signal,
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + dsKey },
+      body: JSON.stringify(reqBody)
+    }).then(function (resp) {
+      clearTimeout(timer);
+      if (!resp.ok) throw new Error((isRead ? 'fetch' : 'search') + ' api http ' + resp.status);
+      return resp.json();
+    }).then(function (j) {
+      var id = 'srvtoolu_sa_' + Math.random().toString(36).slice(2, 10);
+      var i1 = nextIdx(), i2 = nextIdx();
+      var toolResultText;
+      if (isRead) {
+        // 读网页：open_page 动作块 + web_fetch_tool_result（content 为单对象）
+        var title = (j && j.title) || q;
+        var content = (j && j.content) || '';
+        push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i1,
+          content_block: { type: 'server_tool_use', id: id, name: 'deepseek_read_url', kind: 'read_link',
+            input: { action: 'open_page', url: q } } }));
+        push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i1 }));
+        push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i2,
+          content_block: { type: 'web_fetch_tool_result', tool_use_id: id, kind: 'read_link',
+            content: { type: 'web_fetch_result', url: q, content: { title: title }, published_at: '' } } }));
+        push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i2 }));
+        toolResultText = (title ? title + '\n' : '') + String(content).slice(0, self.LEG_TEXT_CAP);
+      } else {
+        var results = (j && j.results) || [];
+        push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i1,
+          content_block: { type: 'server_tool_use', id: id, name: 'deepseek_web_search', kind: 'search',
+            input: { action: 'search', queries: [q] } } }));
+        push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i1 }));
+        push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i2,
+          content_block: { type: 'web_search_tool_result', tool_use_id: id, kind: 'search',
+            content: results.slice(0, 10).map(function (r) {
+              return { type: 'web_search_result', title: r.title || '', url: r.url || '',
+                snippet: r.snippet || r.summary || '', site_name: r.site_name || '',
+                site_icon: r.site_icon || '', page_age: r.date || '' };
+            }) } }));
+        push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i2 }));
+        toolResultText = results.slice(0, 10).map(function (r, i) {
+          return (i + 1) + '. ' + (r.title || '') + '\n' + (r.url || '') + '\n' + (r.snippet || r.summary || '');
+        }).join('\n\n') || '（未搜索到结果）';
+      }
+      return { text: toolResultText };
+    }).catch(function (e) {
+      clearTimeout(timer);
+      throw e;
+    });
+  },
+
+  /* ---------- 极小起名腿（补官方页的 title:{enabled:true} 通道） ---------- */
+  // demo 页官方行为：请求带 title:{enabled:true}（仅会话还没标题时），服务端
+  // 在同一次流式响应的 message_delta 里回 delta.title，侧边栏直接采用。第三方
+  // 端点不认这个字段、不会回标题——故桥接补一条极小 DeepSeek 腿：同样的
+  // title:{enabled:true} + 首条用户消息打官方端点，把服务端生成的标题按官方
+  // 同一条通道（message_delta.delta.title）转发给 demo。成本约 55 in/16 out
+  // token（≈$0.001）；腿与主回答并行发起，延迟被主回答掩盖。失败时退回首条
+  // 消息截断（桥接此前行为）
+  runTitleLeg: function (firstUser, dsKey, signal) {
+    var self = this;
+    var ac = new AbortController();
+    var timer = setTimeout(function () { ac.abort(); }, 15000);
+    if (signal) signal.addEventListener('abort', function () { ac.abort(); }, { once: true });
+    var title = '';
+    var body = {
+      model: 'deepseek-flash', stream: true, max_tokens: 32,
+      system: '该助手为DeepSeek，由深度求索公司创造。',
+      messages: [{ role: 'user', content: String(firstUser).replace(/\s+/g, ' ').trim().slice(0, 500) }],
+      title: { enabled: true }
+    };
+    return this.nativeFetch()(this.DS_LEG_BASE + '/messages', {
+      method: 'POST', signal: ac.signal,
+      headers: { 'Content-Type': 'application/json', 'x-api-key': dsKey, 'Accept': 'text/event-stream' },
+      body: JSON.stringify(body)
+    }).then(function (resp) {
+      if (!resp.ok) throw new Error('title leg http ' + resp.status);
+      return self.pump(resp.body, function (j) {
+        if (j.type === 'message_delta' && j.delta && j.delta.title) title = String(j.delta.title).trim();
+      }, ac.signal);
+    }).then(function () {
+      clearTimeout(timer);
+      return title.slice(0, 30);
+    }).catch(function (e) {
+      clearTimeout(timer);
+      throw e;
+    });
+  },
+
+  /* ---------- 起名来源（demoTitleSource） ---------- */
+  // deepseek=起名腿打 DeepSeek 官方端点（title 参数，官方通道，约 $0.001/次）
+  // model=当前自定义模型按提示词起名（费用走第三方端点，不经 DeepSeek）
+  // off=不起名，退回首条消息截断
+  titleSource: function () {
+    var s = DSE.config.get('demoTitleSource');
+    return (s === 'model' || s === 'off') ? s : 'deepseek';
+  },
+
+  // 自定义模型起名的输出清洗（LibreChat sanitizeTitle 同思路）：
+  // 第三方模型不保证干净输出——推理模型可能把 <think> 吐进正文、可能包引号/
+  // 代码围栏/寒暄。链路：剥思考 → 优先取 JSON 里的 title（围栏不挡匹配，
+  // 顺序不能反）→ 没有 JSON 时按行挑（扔围栏、丢寒暄前缀与过长行）→ 去
+  // 首尾包裹符号与句末标点 → 码点安全截断 → 空则返回 ''（交由上层兜底）
+  cleanTitle: function (raw) {
+    var t = String(raw || '').replace(/<think>[\s\S]*?<\/think>/gi, '');
+    var m = t.match(/"title"\s*:\s*"([^"]{1,60})"/);
+    if (m) {
+      t = m[1];
+    } else {
+      var j = t.match(/\{[\s\S]*\}/);
+      if (j) { try { var o = JSON.parse(j[0]); if (o && o.title) t = String(o.title); } catch (e) {} }
+      if (!m) {
+        t = t.replace(/```[\s\S]*?```/g, ' ');
+        var lines = t.split('\n').map(function (l) { return l.trim(); }).filter(Boolean);
+        var pick = '';
+        for (var i = 0; i < lines.length; i++) {
+          var l = lines[i];
+          if (/^(当然|好的|以下是|这是|根据|希望|标题|如下|为你)/.test(l)) continue;  // 寒暄前缀
+          if (Array.from(l).length > 24) continue;                                   // 标题不会这么长
+          pick = l; break;
+        }
+        t = pick || lines[0] || '';
+      }
+    }
+    t = t.replace(/^["'`“”‘’「『\[\(【〔{]+/, '').replace(/["'`“”‘’」』\]\)】〕}.。.，,！!？?；;：:\s]+$/, '').trim();
+    var cps = Array.from(t);
+    if (cps.length > 30) t = cps.slice(0, 30).join('') + '…';
+    return t.trim();
+  },
+
+  /* ---------- 极小起名腿：自定义模型（提示词起名） ---------- */
+  // source=model 时用当前第三方端点起名：非流式单发。两个实测约束：
+  // ① max_tokens 不能小——StepFun 实测 <256 返 HTTP 200 但 content 空串
+  //    （见 stepfun-api-gotchas）；② step-5-preview 实测忽略
+  //    thinking:{disabled}（响应仍只回 thinking 块），256 预算会被思考全吃光、
+  //    文本块轮不到（stop_reason=max_tokens）→ 故取 1024（与设置里测试按钮
+  //    同款，实测思考+文本都放得下）。URL/headers 复用主出站（已按
+  //    demoKeyHeader 处理过 Key），不另起配置。与主回答并行发起，延迟被掩盖；
+  //    失败/空结果退回首条消息截断。费用走第三方端点，不产生 DeepSeek 模型费
+  runTitleLegModel: function (firstUser, outbound, signal) {
+    var self = this;
+    var ac = new AbortController();
+    var timer = setTimeout(function () { ac.abort(); }, 15000);
+    if (signal) signal.addEventListener('abort', function () { ac.abort(); }, { once: true });
+    var body = {
+      model: outbound.body.model,
+      max_tokens: 1024,
+      stream: false,
+      thinking: { type: 'disabled' },
+      system: this.TITLE_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: String(firstUser).replace(/\s+/g, ' ').trim().slice(0, 500) }]
+    };
+    return this.nativeFetch()(outbound.url, {
+      method: 'POST', signal: ac.signal,
+      headers: Object.assign({ 'Content-Type': 'application/json', 'Accept': 'application/json' }, outbound.headers),
+      body: JSON.stringify(body)
+    }).then(function (resp) {
+      if (!resp.ok) throw new Error('title(model) http ' + resp.status);
+      return resp.json();
+    }).then(function (j) {
+      clearTimeout(timer);
+      var txt = (j.content || []).filter(function (b) { return b.type === 'text'; })
+        .map(function (b) { return b.text || ''; }).join('');
+      return self.cleanTitle(txt);
+    }).catch(function (e) {
+      clearTimeout(timer);
+      throw e;
+    });
+  },
+
+  runLeg: function (toolName, toolInput, dsKey, push, nextIdx, signal) {
+    if ((DSE.config.get('demoToolMode') || 'native') === 'searchapi') {
+      return this.runLegSearchApi(toolName, toolInput, dsKey, push, nextIdx, signal);
+    }
+    var self = this;
+    var q = toolName === 'read_url' ? ('请读取并详细总结这个网页的内容：' + (toolInput.url || ''))
+                                    : ('请深入调研以下问题，搜索并阅读相关网页，然后给出有据可查的结论：\n' + (toolInput.query || ''));
+    var tools = toolName === 'read_url'
+      ? [{ name: 'deepseek_read_url', type: 'deepseek_read_url' }]
+      : [{ name: 'deepseek_read_url', type: 'deepseek_read_url' }, { name: 'deepseek_web_search', type: 'deepseek_web_search' }];
+    var body = { model: 'deepseek-flash', stream: true, thinking: { type: 'enabled' }, max_tokens: 4096, tools: tools, messages: [{ role: 'user', content: q }] };
+    var ac = new AbortController();
+    var timer = setTimeout(function () { ac.abort(); }, this.LEG_TIMEOUT);
+    if (signal) signal.addEventListener('abort', function () { ac.abort(); }, { once: true });
+    return this.nativeFetch()(this.DS_LEG_BASE + '/messages', {
+      method: 'POST', signal: ac.signal,
+      headers: { 'Content-Type': 'application/json', 'x-api-key': dsKey, 'Accept': 'text/event-stream' },
+      body: JSON.stringify(body)
+    }).then(function (resp) {
+      if (!resp.ok) return resp.text().then(function (t) { throw new Error('leg http ' + resp.status + ': ' + t.slice(0, 200)); });
+      var out = { blocks: [], text: '', usage: null };
+      return self.pump(resp.body, function (j) {
+        if (j.type === 'content_block_start') {
+          var cb = j.content_block || {};
+          var b = { index: nextIdx(), raw: cb, fwd: false };
+          out.blocks.push(b);
+          // 工具块与思考块原样转发 demo（id/kind/tool_use_id 保持腿内原值）；
+          // 腿的报告文本不转发——它走 tool_result 喂回模型
+          if (cb.type === 'server_tool_use' || cb.type === 'web_search_tool_result' ||
+              cb.type === 'web_fetch_tool_result' || cb.type === 'thinking') {
+            b.fwd = true;
+            push(self.sseEvent('content_block_start', { type: 'content_block_start', index: b.index, content_block: cb }));
+          }
+        } else if (j.type === 'content_block_delta') {
+          var d = j.delta || {};
+          var blk = out.blocks[out.blocks.length - 1];
+          if (blk && blk.fwd && (d.type === 'thinking_delta' || d.type === 'signature_delta')) {
+            push(self.sseEvent('content_block_delta', { type: 'content_block_delta', index: blk.index, delta: d }));
+          }
+          if (blk && blk.raw.type === 'text' && d.type === 'text_delta') out.text += d.text || '';
+        } else if (j.type === 'content_block_stop') {
+          var b2 = out.blocks[out.blocks.length - 1];
+          if (b2 && b2.fwd) push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: b2.index }));
+        } else if (j.type === 'message_delta') {
+          out.usage = j.usage || out.usage;
+        }
+      }, ac.signal).then(function () { clearTimeout(timer); return out; });
+    }).catch(function (e) {
+      clearTimeout(timer);
+      throw e;
+    });
+  },
+
+  /* ---------- 主流程 ---------- */
+  intercept: function (url, init, dsKey) {
+    var self = this;
+    var body = null;
+    try { body = JSON.parse(init.body); } catch (e) { return null; }
+    if (!body || !body.messages) return null;
+
+    var outbound = this.buildOutbound(body, init.headers || {});
+    var enc = new TextEncoder();
+    var q = [], done = false, wake = null;
+    var push = function (s) { q.push(s); if (wake) { var w = wake; wake = null; w(); } };
+    var finish = function () { done = true; if (wake) { var w = wake; wake = null; w(); } };
+    var ac = new AbortController();
+    if (init.signal) init.signal.addEventListener('abort', function () { ac.abort(); }, { once: true });
+
+    var stream = new ReadableStream({
+      pull: function (c) {
+        if (q.length) { c.enqueue(enc.encode(q.shift())); return; }
+        if (done) { c.close(); return; }
+        return new Promise(function (r) { wake = r; });
+      },
+      cancel: function () { ac.abort(); }
+    });
+
+    (async function () {
+      var idx = 0;
+      var nextIdx = function () { return idx++; };
+      var usage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
+      var addUsage = function (u) {
+        if (!u) return;
+        ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'].forEach(function (k) {
+          if (typeof u[k] === 'number') usage[k] += u[k];
+        });
+      };
+      var wantTitle = !!(body.title && body.title.enabled);
+      // 起名腿与主回答并行发起（标题只需首条用户消息，不必等回答完）——
+      // 官方端点上标题由服务端在同一次请求里顺手生成，第三方端点没这个
+      // 能力，用一条极小腿补上，延迟被主回答掩盖掉。来源由 demoTitleSource
+      // 决定：deepseek=官方端点 title 参数腿；model=自定义模型提示词腿；
+      // off=不起腿（收尾处退回首条消息截断）。
+      // 注意：本闭包是无接收者调用的 async IIFE（bootstrap 还有 'use strict'），
+      // 里面的 this 不是 DemoBridge（严格模式下为 undefined）——必须用函数顶部
+      // 捕获的 self，否则 this.titleSource 直接 TypeError；且该段在下方 try 之前，
+      // 异常会变成 unhandled rejection，表现为流既不推数据也不发请求、页面永远
+      // 挂在"停止生成"（本次开发实测踩到）
+      var titleSrc = self.titleSource();
+      var titleLeg = null;
+      if (wantTitle && titleSrc !== 'off') {
+        var firstUser0 = '';
+        for (var fi = 0; fi < (body.messages || []).length; fi++) {
+          var fm = body.messages[fi];
+          if (fm && fm.role === 'user' && typeof fm.content === 'string') { firstUser0 = fm.content; break; }
+        }
+        if (firstUser0) {
+          titleLeg = (titleSrc === 'model'
+            ? self.runTitleLegModel(firstUser0, outbound, ac.signal)
+            : self.runTitleLeg(firstUser0, dsKey, ac.signal)
+          ).catch(function () { return ''; });
+        }
+      }
+      try {
+        push(self.sseEvent('message_start', {
+          type: 'message_start',
+          message: { id: 'msg_bridge_' + Math.random().toString(36).slice(2, 10), type: 'message', role: 'assistant',
+            model: outbound.body.model, content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }
+        }));
+        // 工具循环：与原生行为一致——模型持续调用工具就持续供给结果，
+        // 直到它自己停止调用（给出最终文本回答）。不设轮数上限、不加
+        // 无进展检测之类的认为中断；需要停止时用页面自身的停止按钮
+        // （abort 经 signal 传到在途请求，流关闭，demo 显示“已停止”）
+        var messages = outbound.body.messages.slice();
+        var stopReason = 'end_turn';
+        while (true) {
+          var resp = await self.nativeFetch()(outbound.url, {
+            method: 'POST', signal: ac.signal,
+            headers: Object.assign({ 'Content-Type': 'application/json', 'Accept': 'text/event-stream' }, outbound.headers),
+            body: JSON.stringify(Object.assign({}, outbound.body, { messages: messages }))
+          });
+          if (!resp.ok) {
+            var et = await resp.text().catch(function () { return ''; });
+            var em = et; try { var ej = JSON.parse(et); em = (ej.error && ej.error.message) || et; } catch (e) {}
+            push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: '模型端点错误 ' + resp.status + '：' + String(em).slice(0, 200) } }));
+            finish(); return;
+          }
+          var blocks = [];       // 本轮完整块（供下一轮历史）
+          var partial = {};      // index → 累积 input_json
+          var roundUsage = null, roundStop = 'end_turn', respModel = '';
+          await self.pump(resp.body, function (j) {
+            if (j.type === 'message_start' && j.message && j.message.model) respModel = j.message.model;
+            if (j.type === 'content_block_start') {
+              var cb = j.content_block || {};
+              var b = { type: cb.type, raw: cb, index: nextIdx() };
+              blocks.push(b); partial[b.index] = '';
+              if (cb.type === 'text' || cb.type === 'thinking' || cb.type === 'tool_use') {
+                push(self.sseEvent('content_block_start', { type: 'content_block_start', index: b.index, content_block: cb }));
+              }
+            } else if (j.type === 'content_block_delta') {
+              var d = j.delta || {};
+              var blk = blocks[blocks.length - 1];
+              if (!blk) return;
+              if (d.type === 'input_json_delta') { partial[blk.index] += d.partial_json || ''; return; }
+              if (d.type === 'text_delta' || d.type === 'thinking_delta' || d.type === 'signature_delta') {
+                if (blk.type === 'tool_use') return;
+                push(self.sseEvent('content_block_delta', { type: 'content_block_delta', index: blk.index, delta: d }));
+              }
+            } else if (j.type === 'content_block_stop') {
+              var b2 = blocks[blocks.length - 1];
+              if (b2) {
+                if (b2.type === 'tool_use') {
+                  try { b2.raw.input = JSON.parse(partial[b2.index] || '{}'); } catch (e) { b2.raw.input = {}; }
+                }
+                push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: b2.index }));
+              }
+            } else if (j.type === 'message_delta') {
+              roundUsage = j.usage || roundUsage;
+              if (j.delta && j.delta.stop_reason) roundStop = j.delta.stop_reason;
+            }
+          }, ac.signal);
+          addUsage(roundUsage);
+          var toolUses = blocks.filter(function (b) { return b.type === 'tool_use'; });
+          if (roundStop !== 'tool_use' || !toolUses.length) { stopReason = roundStop; break; }
+          // 有工具调用 → 逐个跑 DeepSeek 原生腿
+          var results = [];
+          for (var ti = 0; ti < toolUses.length; ti++) {
+            var tu = toolUses[ti];
+            var leg;
+            try {
+              leg = await self.runLeg(tu.raw.name, tu.raw.input || {}, dsKey, push, nextIdx, ac.signal);
+              addUsage(leg.usage);
+            } catch (le) {
+              // 腿失败 → 原生失败形状的搜索块 + 空结果喂回
+              var fidx = nextIdx();
+              push(self.sseEvent('content_block_start', { type: 'content_block_start', index: fidx,
+                content_block: { type: 'server_tool_use', id: 'srvtoolu_b_' + Math.random().toString(36).slice(2, 8), name: 'deepseek_web_search', input: { action: 'search', queries: [String((tu.raw.input || {}).query || '').slice(0, 80)] }, kind: 'search' } }));
+              push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: fidx }));
+              var ridx = nextIdx();
+              push(self.sseEvent('content_block_start', { type: 'content_block_start', index: ridx,
+                content_block: { type: 'web_search_tool_result', tool_use_id: 'srvtoolu_b_x', kind: 'search', content: [{ type: 'web_search_tool_result_error', error_code: 'search_unavailable' }] } }));
+              push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: ridx }));
+              leg = { text: '（搜索失败：' + String(le && le.message || le).slice(0, 120) + '）' };
+            }
+            results.push({ type: 'tool_result', tool_use_id: tu.raw.id, content: String(leg.text || '').slice(0, self.LEG_TEXT_CAP) || '（无结果）' });
+          }
+          // 历史追加：assistant 原样 + user tool_result（tool_result 在前，无文本）
+          messages = messages.concat([
+            { role: 'assistant', content: blocks.map(function (b) { return b.raw; }) },
+            { role: 'user', content: results }
+          ]);
+        }
+        // 精确上下文占用：最后一轮响应的 usage（input + cache_read + cache_creation）
+        // ——即本次请求模型实际收到的全部内容（系统/工具/历史），非估算
+        if (roundUsage) {
+          var uIn = roundUsage.input_tokens || 0;
+          var uCacheRead = roundUsage.cache_read_input_tokens || 0;
+          var uCacheCreate = roundUsage.cache_creation_input_tokens || 0;
+          var used = uIn + uCacheRead + uCacheCreate;
+          if (used > 0) {
+            // 构成估算：请求是我们构造的，系统/工具/消息三块的 token 占比可算
+            // （精确总量来自 usage；占比为估算，面板内已标注）
+            var estSys = Utils.estimateTokens(outbound.body.system || '');
+            var estTool = Utils.estimateTokens(JSON.stringify(outbound.body.tools || []));
+            var estMsg = Utils.estimateTokens(JSON.stringify(messages));
+            DSE.emit('ctx:api', {
+              used: used, input: uIn, cacheRead: uCacheRead, cacheCreate: uCacheCreate,
+              estSys: estSys, estTool: estTool, estMsg: estMsg,
+              model: respModel || outbound.body.model || ''
+            });
+          }
+        }
+        // 收尾
+        var sr = (stopReason === 'end_turn' || stopReason === 'max_tokens' || stopReason === 'refusal') ? stopReason : 'end_turn';
+        var delta = { stop_reason: sr, stop_sequence: null };
+        if (wantTitle) {
+          // 优先起名腿拿到的标题（deepseek 源是服务端生成的官方同款；model
+          // 源是自定义模型输出、已过 cleanTitle 清洗）；腿关闭/失败时退回首条
+          // 消息截断——桥接此前行为
+          var title = '';
+          if (titleLeg) { try { title = (await titleLeg) || ''; } catch (e) { title = ''; } }
+          if (!title) {
+            for (var mi = 0; mi < messages.length; mi++) {
+              if (messages[mi].role === 'user' && typeof messages[mi].content === 'string') {
+                title = messages[mi].content.replace(/\s+/g, ' ').trim().slice(0, 20); break;
+              }
+            }
+          }
+          if (title) delta.title = title;
+        }
+        push(self.sseEvent('message_delta', { type: 'message_delta', delta: delta, usage: usage }));
+        push(self.sseEvent('message_stop', { type: 'message_stop' }));
+      } catch (e) {
+        if (e && e.name === 'AbortError') { finish(); return; }
+        push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: String(e && e.message || e).slice(0, 200) } }));
+      }
+      finish();
+    })();
+
+    return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache' } });
+  }
+};
+DSE.modules.demoBridge = DemoBridge;
