@@ -19,24 +19,10 @@ var Think = {
   clearOpen: function () {
     document.querySelectorAll(SEL.thinkBlock + '.dse-think-open').forEach(function (b) { b.classList.remove('dse-think-open'); });
   },
-  // 折叠规则按当前站点的思考块类名动态生成：主站 ._74c0879 / demo
-  // area-_3d93a（见 selectors.js 的 SEL_DEMO）。静态 CSS 里写死主站哈希的
-  // 旧规则在 demo 页完全不命中——body 挂着 dse-think-collapse 但思考内容
-  // 照常显示，表现为「思考折叠没生效」。
-  // 注意与主站严格对齐：只隐藏思考正文（.ds-think-content），思考块内的
-  // 其它内容（主站的 ._8f7678d、demo 的联网搜索工具调用摘要）保持可见——
-  // 这是原版的设计行为，不要"顺手"把整个思考区藏掉。
-  installCss: function () {
-    try {
-      Bridge.addStyle('body.dse-think-collapse ' + SEL.thinkBlock + ':not(.dse-think-open) ' +
-        SEL.thinkContent + '{display:none!important}');
-    } catch (e) {}
-  },
   init: function () {
     var self = this;
     Utils.onReady(function () {
       self.syncBody();
-      self.installCss();
       // 接管折叠头点击：存在思考正文时用 CSS 显隐切换，杜绝站点移除 DOM 引起的滚动跳动
       document.addEventListener('click', function (e) {
         if (!DSE.config.get('thinkAutoCollapse')) return; // 关闭时完全交给站点原生行为

@@ -83,7 +83,7 @@ var Bridge = {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DSE = window.DSE = {
-  version: '8.7.12',
+  version: '8.7.13',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   bridge: Bridge,
   modules: {},
@@ -776,8 +776,9 @@ body.dse-preset-frosted .bubble-_4cfe7{background:rgba(59,108,246,.72)!important
 body.dse-preset-frosted.dark .bubble-_4cfe7{background:rgba(59,108,246,.6)!important}
 body.dse-preset-water .bubble-_4cfe7{color:#fff!important;background:linear-gradient(135deg,rgba(59,108,246,.66),rgba(92,132,255,.5))!important;backdrop-filter:blur(14px) saturate(165%);-webkit-backdrop-filter:blur(14px) saturate(165%);box-shadow:0 4px 16px rgba(59,108,246,.22),inset 0 1px 0 rgba(255,255,255,.28)}
 body.dse-preset-water.dark .bubble-_4cfe7{background:linear-gradient(135deg,rgba(59,108,246,.55),rgba(80,110,220,.42))!important}
-/* demo 无虚拟列表，消息行间距直接用行容器 */
+/* demo 无虚拟列表，消息行间距直接用行容器（与主站 ._4f9bf79/._9663006 规则对齐） */
 .message-e1faee, .bubble-_4cfe7{margin-bottom:14px}
+.message-e1faee:last-child, .bubble-_4cfe7:last-child{margin-bottom:4px}
 `);
 
 /* ===== styles/markdown.css.js ===== */
@@ -856,10 +857,13 @@ Bridge.addStyle(`
 
 /* ===== 思考区 CSS 折叠（见 modules/think.js）=====
    只隐藏正文，不点击、不移动站点节点 → 长对话滚动不再因高度突变而跳动。
-   内容隐藏规则由 think.js 按 SEL.thinkBlock 动态生成（主站/demo 通吃），
-   这里保留主站静态规则 + demo 的箭头旋转（构建哈希，官方重建后可能失效）。 */
+   与主站严格对齐：只藏 .ds-think-content，思考块内其它内容（主站 ._8f7678d、
+   demo 的联网搜索工具摘要）保持可见——那是原版的设计行为。
+   下面第二条起为 chat-demo 的对应规则（构建哈希，官方重建后可能失效，
+   与 selectors.js 的 SEL_DEMO 同一维护模式）。 */
 body.dse-think-collapse ._74c0879:not(.dse-think-open) .ds-think-content{display:none!important}
 body.dse-think-collapse ._74c0879:not(.dse-think-open) ._3d79d66{transform:rotate(-90deg)}
+body.dse-think-collapse .area-_3d93a:not(.dse-think-open) .ds-think-content{display:none!important}
 body.dse-think-collapse .area-_3d93a:not(.dse-think-open) .title-_3d93a > svg{transform:rotate(-90deg)}
 
 /* 通用隐藏标记（移动版下载应用/AI 标识等由 JS 命中后打上） */
@@ -910,6 +914,11 @@ body.dark.dse-input-frosted .wrapper-ed6f47{box-shadow:0 8px 32px rgba(0,0,0,.4)
 body.dse-input-frosted .wrapper-ed6f47:focus-within{border-color:var(--dse-accent)!important;
   box-shadow:0 10px 36px rgba(59,108,246,.16)!important}
 body.dse-input-frosted .wrapper-ed6f47 textarea{background:transparent!important}
+@media (max-width:640px){
+  body.dse-input-frosted .wrapper-ed6f47{border-radius:20px!important;
+    /* 与主站一致：输入框与屏幕底部保持间距（含手势条安全区） */
+    margin-bottom:max(12px,env(safe-area-inset-bottom))!important}
+}
 @media (max-width:640px){
   body.dse-input-frosted ._77cefa5{border-radius:20px!important}
   /* 输入框与屏幕底部保持间距（含手势条安全区），间隙由固定背景层透出，不会出现黑条 */
@@ -1511,24 +1520,10 @@ var Think = {
   clearOpen: function () {
     document.querySelectorAll(SEL.thinkBlock + '.dse-think-open').forEach(function (b) { b.classList.remove('dse-think-open'); });
   },
-  // 折叠规则按当前站点的思考块类名动态生成：主站 ._74c0879 / demo
-  // area-_3d93a（见 selectors.js 的 SEL_DEMO）。静态 CSS 里写死主站哈希的
-  // 旧规则在 demo 页完全不命中——body 挂着 dse-think-collapse 但思考内容
-  // 照常显示，表现为「思考折叠没生效」。
-  // 注意与主站严格对齐：只隐藏思考正文（.ds-think-content），思考块内的
-  // 其它内容（主站的 ._8f7678d、demo 的联网搜索工具调用摘要）保持可见——
-  // 这是原版的设计行为，不要"顺手"把整个思考区藏掉。
-  installCss: function () {
-    try {
-      Bridge.addStyle('body.dse-think-collapse ' + SEL.thinkBlock + ':not(.dse-think-open) ' +
-        SEL.thinkContent + '{display:none!important}');
-    } catch (e) {}
-  },
   init: function () {
     var self = this;
     Utils.onReady(function () {
       self.syncBody();
-      self.installCss();
       // 接管折叠头点击：存在思考正文时用 CSS 显隐切换，杜绝站点移除 DOM 引起的滚动跳动
       document.addEventListener('click', function (e) {
         if (!DSE.config.get('thinkAutoCollapse')) return; // 关闭时完全交给站点原生行为
@@ -2311,13 +2306,20 @@ var Buttons = {
   findToolbar: function () {
     var t = document.querySelector(SEL.inputToolbar);
     if (t && t.offsetParent !== null) return t;
-    // 兜底（主站改版 / 同家族页面如 cdn.deepseek.com/chat-demo——独立构建、
-    // class 全是构建哈希，靠类名定位必然落空）：
-    // 规则完全不依赖哈希：找「含“深度思考”开关、含按钮、但不含输入框」的
-    // 最小容器。主站输入框与开关行同层，向上一层即可命中；demo 页开关行
-    // （functionRow）与输入框是兄弟节点，同样命中。
+    // 原版兜底：找包含“深度思考”开关的那一行（逻辑保持原样，主站改版时行为不变）
     var ta = document.querySelector(SEL.textarea);
     if (!ta) return null;
+    var box = ta.closest('._871cbca') || ta.parentElement;
+    var hit = null;
+    if (box) box.querySelectorAll('div').forEach(function (d) {
+      if (hit) return;
+      if (/深度思考/.test(d.textContent || '') && d.children.length <= 8) hit = d.parentElement;
+    });
+    if (hit) return hit;
+    // 原版兜底落空时的补充定位（如 cdn.deepseek.com/chat-demo：独立构建、
+    // class 全是构建哈希，且开关行与输入框是兄弟节点，向上一层找不到）。
+    // 规则不依赖哈希：找「含“深度思考”开关、含按钮、不含输入框」的最小容器，
+    // 直接子按钮优先、后代元素数兜底（整行 > 开关组）。
     var cands = [];
     Array.prototype.forEach.call(document.querySelectorAll('div'), function (d) {
       if (d.contains(ta)) return;                          // 含输入框的不是工具行
@@ -2329,8 +2331,6 @@ var Buttons = {
     });
     var row = null, rowScore = -1;
     cands.forEach(function (d) {
-      // 评分：直接子元素含按钮的优先（工具行本身），其次取后代元素更多的
-      // （整行 > 开关组——demo 页按钮嵌在行内更深一层，行本身没有直接按钮子元素）
       var direct = Array.prototype.some.call(d.children, function (c) { return c.tagName === 'BUTTON'; });
       var score = (direct ? 1000 : 0) + d.querySelectorAll('*').length;
       if (score > rowScore) { rowScore = score; row = d; }

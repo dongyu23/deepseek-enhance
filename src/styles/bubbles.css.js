@@ -46,6 +46,7 @@ body.dse-preset-frosted .bubble-_4cfe7{background:rgba(59,108,246,.72)!important
 body.dse-preset-frosted.dark .bubble-_4cfe7{background:rgba(59,108,246,.6)!important}
 body.dse-preset-water .bubble-_4cfe7{color:#fff!important;background:linear-gradient(135deg,rgba(59,108,246,.66),rgba(92,132,255,.5))!important;backdrop-filter:blur(14px) saturate(165%);-webkit-backdrop-filter:blur(14px) saturate(165%);box-shadow:0 4px 16px rgba(59,108,246,.22),inset 0 1px 0 rgba(255,255,255,.28)}
 body.dse-preset-water.dark .bubble-_4cfe7{background:linear-gradient(135deg,rgba(59,108,246,.55),rgba(80,110,220,.42))!important}
-/* demo 无虚拟列表，消息行间距直接用行容器 */
+/* demo 无虚拟列表，消息行间距直接用行容器（与主站 ._4f9bf79/._9663006 规则对齐） */
 .message-e1faee, .bubble-_4cfe7{margin-bottom:14px}
+.message-e1faee:last-child, .bubble-_4cfe7:last-child{margin-bottom:4px}
 `);

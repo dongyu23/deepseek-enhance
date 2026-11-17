@@ -10,13 +10,20 @@ var Buttons = {
   findToolbar: function () {
     var t = document.querySelector(SEL.inputToolbar);
     if (t && t.offsetParent !== null) return t;
-    // 兜底（主站改版 / 同家族页面如 cdn.deepseek.com/chat-demo——独立构建、
-    // class 全是构建哈希，靠类名定位必然落空）：
-    // 规则完全不依赖哈希：找「含“深度思考”开关、含按钮、但不含输入框」的
-    // 最小容器。主站输入框与开关行同层，向上一层即可命中；demo 页开关行
-    // （functionRow）与输入框是兄弟节点，同样命中。
+    // 原版兜底：找包含“深度思考”开关的那一行（逻辑保持原样，主站改版时行为不变）
     var ta = document.querySelector(SEL.textarea);
     if (!ta) return null;
+    var box = ta.closest('._871cbca') || ta.parentElement;
+    var hit = null;
+    if (box) box.querySelectorAll('div').forEach(function (d) {
+      if (hit) return;
+      if (/深度思考/.test(d.textContent || '') && d.children.length <= 8) hit = d.parentElement;
+    });
+    if (hit) return hit;
+    // 原版兜底落空时的补充定位（如 cdn.deepseek.com/chat-demo：独立构建、
+    // class 全是构建哈希，且开关行与输入框是兄弟节点，向上一层找不到）。
+    // 规则不依赖哈希：找「含“深度思考”开关、含按钮、不含输入框」的最小容器，
+    // 直接子按钮优先、后代元素数兜底（整行 > 开关组）。
     var cands = [];
     Array.prototype.forEach.call(document.querySelectorAll('div'), function (d) {
       if (d.contains(ta)) return;                          // 含输入框的不是工具行
@@ -28,8 +35,6 @@ var Buttons = {
     });
     var row = null, rowScore = -1;
     cands.forEach(function (d) {
-      // 评分：直接子元素含按钮的优先（工具行本身），其次取后代元素更多的
-      // （整行 > 开关组——demo 页按钮嵌在行内更深一层，行本身没有直接按钮子元素）
       var direct = Array.prototype.some.call(d.children, function (c) { return c.tagName === 'BUTTON'; });
       var score = (direct ? 1000 : 0) + d.querySelectorAll('*').length;
       if (score > rowScore) { rowScore = score; row = d; }
