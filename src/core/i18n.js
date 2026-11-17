@@ -55,6 +55,10 @@ var I18N = {
     'LaTeX 公式渲染': 'LaTeX rendering',
     '离线 KaTeX，渲染 \\( \\)、\\[ \\]、$ 公式': 'Offline KaTeX for \\( \\), \\[ \\], $ formulas',
     '隐式时间注入': 'Implicit time injection',
+    // ---------- chat-demo 模型切换 ----------
+    '模型': 'Model',
+    'deepseek-flash（官方默认）': 'deepseek-flash (official default)',
+    '留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段，端点 / Key / 工具一律不变': 'Leave empty for the official default (deepseek-flash). Only the model field in the request is swapped; endpoint, key and tools stay untouched',
     '本会话上下文用量': 'Session context usage',
     '提醒阈值': 'Warning threshold',
     '当前模型上下文约 1M；用量达到该百分比时弹一次提醒。': 'The current model context is about 1M. A reminder pops up when usage reaches this percentage.',
