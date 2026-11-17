@@ -83,7 +83,7 @@ var Bridge = {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DSE = window.DSE = {
-  version: '8.7.8',
+  version: '8.7.9',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   bridge: Bridge,
   modules: {},
@@ -242,6 +242,30 @@ var SEL = {
   // 原生 mermaid 图表容器（美化时避让）
   mermaidPanel: '[class*="mermaid"], .ds-markdown svg'
 };
+
+/* ---- cdn.deepseek.com/chat-demo（API 使用 demo）----
+ * 与主站是两套独立 bundle：消息区复用 ds-markdown / ds-think-content /
+ * md-code-block 等稳定设计 token（上方共用，无需覆盖），但页面骨架与消息
+ * 行类名全是构建哈希（message-e1faee / container-_4cfe7 / area-_3d93a /
+ * title-_3d93a / actions-_4cfe7 / scroll-_7ccaf）。官方重建 demo 后这些
+ * 哈希会变，届时只需更新下面这一组——与主站选择器同一维护模式。
+ * demo 无虚拟列表：消息在普通滚动容器 .scroll-_7ccaf 内顺序渲染；
+ * 用户消息行与 AI 消息底部容器复用同一 CSS 模块（container-_4cfe7），
+ * 取消息行会重复命中，故用户行改用气泡类 bubble-_4cfe7。 */
+var SEL_DEMO = {
+  virtualList: '.scroll-_7ccaf',
+  msg: '.message-e1faee, .bubble-_4cfe7',
+  msgRowAi: '.message-e1faee',
+  msgRowUser: '.bubble-_4cfe7',
+  userMsg: '.bubble-_4cfe7',
+  userBubble: '.bubble-_4cfe7',
+  aiActionBar: '.actions-_4cfe7',
+  thinkBlock: '.area-_3d93a',
+  thinkHeader: '.title-_3d93a'
+};
+if (location.hostname === 'cdn.deepseek.com') {
+  Object.keys(SEL_DEMO).forEach(function (k) { SEL[k] = SEL_DEMO[k]; });
+}
 DSE.SEL = SEL;
 DSE.register('selectors', SEL);
 
@@ -743,6 +767,17 @@ body.dse-preset-water .ds-markdown.ds-assistant-message-main-content > *{positio
 body.dse-preset-water.dark .ds-markdown.ds-assistant-message-main-content{color:#e7e9ee!important;border-color:rgba(255,255,255,.12)!important;background:linear-gradient(135deg,rgba(48,51,62,.86),rgba(34,36,44,.72))!important;backdrop-filter:blur(18px) saturate(165%);-webkit-backdrop-filter:blur(18px) saturate(165%);box-shadow:0 4px 20px rgba(0,0,0,.4),inset 0 1px 0 rgba(255,255,255,.08)!important}
 body.dse-preset-water .fbb737a4{color:#fff!important;background:linear-gradient(135deg,rgba(59,108,246,.66),rgba(92,132,255,.5))!important;backdrop-filter:blur(14px) saturate(165%);-webkit-backdrop-filter:blur(14px) saturate(165%);box-shadow:0 4px 16px rgba(59,108,246,.22),inset 0 1px 0 rgba(255,255,255,.28)}
 body.dse-preset-water.dark .fbb737a4{background:linear-gradient(135deg,rgba(59,108,246,.55),rgba(80,110,220,.42))!important}
+
+/* ===== cdn.deepseek.com/chat-demo 用户气泡（构建哈希，官方重建后可能失效，见 selectors.js）===== */
+.bubble-_4cfe7{border-radius:16px!important;transition:filter .2s, background .2s}
+body.dse-preset-default .bubble-_4cfe7{background:#e8eefc!important;color:#1d2129!important}
+body.dse-preset-default.dark .bubble-_4cfe7{background:rgba(59,108,246,.32)!important;color:#eef2ff!important}
+body.dse-preset-frosted .bubble-_4cfe7{background:rgba(59,108,246,.72)!important;color:#fff!important;backdrop-filter:blur(22px) saturate(180%);-webkit-backdrop-filter:blur(22px) saturate(180%)}
+body.dse-preset-frosted.dark .bubble-_4cfe7{background:rgba(59,108,246,.6)!important}
+body.dse-preset-water .bubble-_4cfe7{color:#fff!important;background:linear-gradient(135deg,rgba(59,108,246,.66),rgba(92,132,255,.5))!important;backdrop-filter:blur(14px) saturate(165%);-webkit-backdrop-filter:blur(14px) saturate(165%);box-shadow:0 4px 16px rgba(59,108,246,.22),inset 0 1px 0 rgba(255,255,255,.28)}
+body.dse-preset-water.dark .bubble-_4cfe7{background:linear-gradient(135deg,rgba(59,108,246,.55),rgba(80,110,220,.42))!important}
+/* demo 无虚拟列表，消息行间距直接用行容器 */
+.message-e1faee, .bubble-_4cfe7{margin-bottom:14px}
 `);
 
 /* ===== styles/markdown.css.js ===== */
@@ -1694,7 +1729,21 @@ var Tweaks = {
       if (n.closest && n.closest('#dse-panel')) continue;
       if (n.children.length > 2) continue;
       var t = (n.textContent || '').trim();
-      if (t && t.length < 30 && re.test(t)) n.setAttribute('data-dse-hide', '1');
+      if (!t || t.length >= 30 || !re.test(t)) continue;
+      // 只隐藏“标识本身”，两种形态认：
+      //  1) 直接文本节点就是标识（叶子元素，最可靠）；
+      //  2) 全文含标识但不含任何交互控件。
+      // 反过来——文本里“夹带”了标识、自身又是输入框/按钮容器——绝不能藏：
+      // chat-demo 页的输入容器只有 2 个子节点、全文 22 字符，曾通过旧规则
+      // 被误打标记，[data-dse-hide] 的 !important 把整个输入框隐藏掉
+      // （页面生成结束后恢复的内联样式都被压住），表现为“输入框消失”。
+      // 控件名单不含 <a>：主站标识若附带说明链接，保持与旧版一致的隐藏行为。
+      var direct = '';
+      for (var c = 0; c < n.childNodes.length; c++) {
+        if (n.childNodes[c].nodeType === 3) direct += n.childNodes[c].nodeValue;
+      }
+      var hasCtrl = n.querySelector('textarea,input,button,[role="button"],[role="textbox"]');
+      if (re.test(direct.trim()) || !hasCtrl) n.setAttribute('data-dse-hide', '1');
     }
   },
   scan: function () {
@@ -1893,9 +1942,10 @@ var Nav = {
   bar: null, busy: false, lastDir: 1,
 
   container: function () {
-    var el = document.querySelector('.ds-virtual-list.ds-scroll-area') || document.querySelector('.ds-virtual-list');
+    // SEL.virtualList 主站=.ds-virtual-list、demo=.scroll-_7ccaf（见 selectors.js）
+    var el = document.querySelector('.ds-virtual-list.ds-scroll-area') || document.querySelector(SEL.virtualList);
     if (el && el.scrollHeight > el.clientHeight) return el;
-    var node = document.querySelector('.ds-virtual-list-visible-items') || document.querySelector('.ds-message');
+    var node = document.querySelector(SEL.visibleItems) || document.querySelector(SEL.msg);
     var p = node ? (node.parentElement || null) : null;
     while (p) {
       var cs = getComputedStyle(p);
@@ -1907,7 +1957,7 @@ var Nav = {
 
   rows: function () {
     var out = [];
-    var nodes = document.querySelectorAll('.ds-message');
+    var nodes = document.querySelectorAll(SEL.msg);
     for (var i = 0; i < nodes.length; i++) {
       var r = nodes[i].getBoundingClientRect();
       if (r.width === 0 && r.height === 0) continue;
