@@ -47,11 +47,7 @@ var SEL_DEMO = {
   userBubble: '.bubble-_4cfe7',
   aiActionBar: '.actions-_4cfe7',
   thinkBlock: '.area-_3d93a',
-  thinkHeader: '.title-_3d93a',
-  // demo 思考区里除 .ds-think-content 外还有联网搜索的工具调用摘要块
-  // （"搜索到 N 个网页"/"浏览 N 个页面"，与正文是兄弟节点）——折叠时需
-  // 整块隐藏，只留折叠头，否则出现"头折叠了、搜索过程还露着"的半折叠态。
-  thinkCollapseAll: true
+  thinkHeader: '.title-_3d93a'
 };
 if (location.hostname === 'cdn.deepseek.com') {
   Object.keys(SEL_DEMO).forEach(function (k) { SEL[k] = SEL_DEMO[k]; });
