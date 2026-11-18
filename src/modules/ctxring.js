@@ -151,7 +151,8 @@ var CtxRing = {
       (modelName ? '<span style="font-size:11px;opacity:.55;font-weight:400;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + Utils.escHtml(modelName) + '">' + Utils.escHtml(modelName) + '</span>' : '') +
       '</div>';
     html += '<div style="font-size:15px;font-weight:600;margin-bottom:8px">' + this.fmt(d.used) + '/' + this.fmt(limit) +
-      '<span style="font-weight:400;font-size:12px;opacity:.75">（' + pct.toFixed(pct >= 10 ? 1 : 1) + '%）</span></div>';
+      '<span style="font-weight:400;font-size:12px;opacity:.75">（' + pct.toFixed(pct >= 10 ? 1 : 1) + '%' +
+      (d.estimated ? '，' + DSE.t('估算') : '') + '）</span></div>';
     html += '<div style="height:6px;border-radius:3px;background:' + line + ';overflow:hidden;margin-bottom:10px">' +
       '<div style="height:100%;width:' + pct + '%;border-radius:3px;background:' +
       (pct >= 90 ? '#f87171' : (pct >= 70 ? '#fbbf24' : 'var(--dse-accent)')) + '"></div></div>';
@@ -164,7 +165,9 @@ var CtxRing = {
     html += '<div style="display:flex;justify-content:space-between"><span style="color:' + dim + '">' +
       DSE.t('平均缓存命中率') + '</span><span>' + hit.toFixed(1) + '%</span></div>';
     html += '<div style="color:' + dim + ';font-size:11px;margin-top:6px">' +
-      DSE.t('总量与缓存命中率为接口 usage 精确值；构成占比按请求结构估算') + '</div>';
+      (d.estimated
+        ? DSE.t('该端点未回传 usage，此处按请求体结构估算')
+        : DSE.t('总量与缓存命中率为接口 usage 精确值；构成占比按请求结构估算')) + '</div>';
     p.innerHTML = html;
   },
 
