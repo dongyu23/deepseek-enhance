@@ -83,7 +83,7 @@ var Bridge = {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DSE = window.DSE = {
-  version: '8.8.1',
+  version: '8.8.2',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   bridge: Bridge,
   modules: {},
@@ -3939,7 +3939,8 @@ DSE.modules.demoBridge = DemoBridge;
  * （input + cache_read + cache_creation = 本次请求模型实际收到的全部
  * 内容：系统提示/工具定义/完整历史——非文本估算），经 'ctx:api' 事件
  * 广播。本模块只负责把占用/窗口画成一个环，注入在输入工具条里、
- * 发送按钮一侧；仅在开启自定义模型且已产生一次交换后出现。
+ * 发送按钮一侧。常驻显示：开着自定义模型就在（首次对话前显示 0%），
+ * 交换后变精确值；关闭总开关才隐藏。
  * ============================================================ */
 var CtxRing = {
   SIZE: 22, R: 8.5,
@@ -3989,9 +3990,12 @@ var CtxRing = {
 
   update: function (data) {
     var self = this;   // 必须在方法内捕获——裸 self 会解析到浏览器全局 window.self
-    var used = data && data.used ? data.used : data;
+    // 注意 used===0 的判定：早先用 `data.used ? data.used : data`，0 是 falsy
+    // 会把整个对象当数字用、pct 算成 NaN（环报废）。现在按类型分流，0 正常走
+    var isObj = !!data && typeof data === 'object';
+    var used = isObj ? (Number(data.used) || 0) : (Number(data) || 0);
     this._last = used;
-    this._data = (data && data.used) ? data : { used: used, input: used, cacheRead: 0, cacheCreate: 0, estSys: 0, estTool: 0, estMsg: used };
+    this._data = isObj ? data : { used: used, input: used, cacheRead: 0, cacheCreate: 0, estSys: 0, estTool: 0, estMsg: used };
     var btn = document.getElementById('dse-ctx-ring') || this.inject();
     if (!btn) return;
     var limit = this.limit();
@@ -4089,17 +4093,26 @@ var CtxRing = {
     if (p) p.style.display = 'none';
   },
 
+  // 无数据时的占位载荷：圆圈常驻显示（用户要求），首次对话前显示 0%
+  emptyData: function () {
+    return { used: 0, input: 0, cacheRead: 0, cacheCreate: 0, estSys: 0, estTool: 0, estMsg: 0, model: '' };
+  },
+
   init: function () {
     var self = this;
     Utils.onReady(function () {
       self.inject();
       DSE.on('ctx:api', function (p) { if (p && p.used > 0) self.update(p); });
-      // 总开关关闭时隐藏；窗口配置变更时按新上限重画
+      // 常驻显隐由总开关决定：关→隐藏；开→立刻显示（没数据时 0%），不必等
+      // 首次对话——用户要求圆圈一直显示
       DSE.on('cfg:change', function (e) {
-        if (e.path === 'demoCustom' && !e.value) {
-          var b = document.getElementById('dse-ctx-ring');
-          if (b) b.style.display = 'none';
-          self.hidePanel();
+        if (e.path === 'demoCustom') {
+          if (e.value) self.update(self._data || self.emptyData());
+          else {
+            var b = document.getElementById('dse-ctx-ring');
+            if (b) b.style.display = 'none';
+            self.hidePanel();
+          }
         }
         if (e.path === 'demoCtxLimit' && self._data) { self.update(self._data); self.hidePanel(); }
       });
@@ -4108,9 +4121,11 @@ var CtxRing = {
         if (document.getElementById('dse-ctx-ring')) return;
         self.inject();
         // 用 _data（完整对象）重画——传 _last（数字）会走 update 的兜底分支，
-        // 把构成估算数据清零
-        if (self._data) self.update(self._data);
+        // 把构成估算数据清零；没有数据也要画（常驻 0%）
+        self.update(self._data || self.emptyData());
       }, 400)).observe(document.body, { childList: true, subtree: true });
+      // 首帧即显示（开着自定义模型时）
+      self.update(self._data || self.emptyData());
     });
   }
 };
