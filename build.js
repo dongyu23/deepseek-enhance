@@ -21,8 +21,10 @@ const ORDER = [
   ['modules/buttons.js'],
   ['modules/demoapi.js'],
   ['modules/demosearch.js'],
+  ['modules/demopastetxt.js'],
   ['modules/demobridge.js'],
   ['modules/ctxring.js'],
+  ['modules/tabtitle.js'],
   ['settings/panel.js'],
   ['main.js'], ['footer.js']
 ].map((x) => x[0]);

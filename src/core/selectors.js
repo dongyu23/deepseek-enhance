@@ -52,6 +52,11 @@ var SEL_DEMO = {
   // aria-label 文本匹配，不依赖哈希）
   appTop: '.top-ac14ac',
   sidebarItem: '.item-ff6fc9',
+  // 当前会话在侧边栏里的标记：打开某会话后该项加上 active-ff6fc9（实测背景
+  // 变 rgb(53,54,56)、无 aria 属性可依），会话名在 .title-ff6fc9 里
+  sidebarItemActive: '.item-ff6fc9.active-ff6fc9',
+  sidebarItemTitle: '.title-ff6fc9',
+  sidebarList: '.section-ac14ac',
   // demo 是客户端直连 api.deepseek.com：无服务端会话 id、无 history_messages
   // 接口、无 accumulated_token_usage 真值——上下文用量统计整段不适用，
   // 设置面板里对应分区（含"立即重新统计"按钮）据此隐藏。

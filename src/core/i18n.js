@@ -72,6 +72,8 @@ var I18N = {
     '搜索对话内容...': 'Search conversation content...',
     '暂无相关结果': 'No matching results',
     '新对话': 'New chat',
+    // 粘贴大段文本转 txt（官方同款文案）
+    '内容已恢复到输入框': 'Content restored to the input box.',
     'native：模型自己搜': 'native: model-driven',
     'searchapi：只付搜索费': 'searchapi: search fee only',
     'native（原生）': 'native (native tools)',
