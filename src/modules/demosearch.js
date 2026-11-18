@@ -59,10 +59,11 @@ var DemoSearch = {
     var self = this;
     Utils.onReady(function () {
       self.injectEntry();
-      // demo 头部会随侧边栏开合重绘——掉了就补（同 demoapi 的自愈模式）
-      new MutationObserver(Utils.debounce(function () {
+      // demo 头部会随侧边栏开合重绘——掉了就补。节流（带前缘）而非防抖：
+      // 防抖会被连续 DOM 变动重置，入口迟迟不出现
+      new MutationObserver(Utils.throttle(function () {
         if (!document.getElementById('dse-search-entry')) self.injectEntry();
-      }, 300)).observe(document.body, { childList: true, subtree: true });
+      }, 100)).observe(document.body, { childList: true, subtree: true });
       // 主题切换：只更新根节点上的配色变量，已渲染条目自动跟随
       Utils.onThemeChange(function () { self.paint(); });
     });

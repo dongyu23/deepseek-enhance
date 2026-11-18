@@ -83,7 +83,7 @@ var Bridge = {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DSE = window.DSE = {
-  version: '8.8.2',
+  version: '8.8.3',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   bridge: Bridge,
   modules: {},
@@ -2954,11 +2954,15 @@ var DemoApi = {
       self.injectUI();
       self.fixLogo();      // 应用名可能还没被 React 渲染出来——下面的 observer 会补
       // 弹窗是 React 组件，开合/切 tab 会重建 DOM——有弹窗时才补注入；
-      // 应用名被重绘恢复成文字时也靠这里补
-      new MutationObserver(Utils.debounce(function () {
+      // 应用名被重绘恢复成文字时也靠这里补。
+      // 用节流（带前缘）而非防抖：防抖在弹窗打开时会因 React 连续变 DOM 而
+      // 不断重置计时，注入要等变动停 300ms 才发生（实测开弹窗到 tab 出现
+      // ~310ms，反复开尤其明显）；节流前缘让弹窗 DOM 一就绪就注入，尾部再补
+      // 一次兜底。已注入时 injectUI 是几个 querySelector 的早退，代价可忽略
+      new MutationObserver(Utils.throttle(function () {
         if (document.querySelector('[class*="dialogMain-"]')) self.injectUI();
         self.fixLogo();
-      }, 300)).observe(document.body, { childList: true, subtree: true });
+      }, 100)).observe(document.body, { childList: true, subtree: true });
     });
   },
 
@@ -3040,10 +3044,11 @@ var DemoSearch = {
     var self = this;
     Utils.onReady(function () {
       self.injectEntry();
-      // demo 头部会随侧边栏开合重绘——掉了就补（同 demoapi 的自愈模式）
-      new MutationObserver(Utils.debounce(function () {
+      // demo 头部会随侧边栏开合重绘——掉了就补。节流（带前缘）而非防抖：
+      // 防抖会被连续 DOM 变动重置，入口迟迟不出现
+      new MutationObserver(Utils.throttle(function () {
         if (!document.getElementById('dse-search-entry')) self.injectEntry();
-      }, 300)).observe(document.body, { childList: true, subtree: true });
+      }, 100)).observe(document.body, { childList: true, subtree: true });
       // 主题切换：只更新根节点上的配色变量，已渲染条目自动跟随
       Utils.onThemeChange(function () { self.paint(); });
     });
@@ -4116,14 +4121,15 @@ var CtxRing = {
         }
         if (e.path === 'demoCtxLimit' && self._data) { self.update(self._data); self.hidePanel(); }
       });
-      // 工具条会随会话切换重建——保持圆圈在场
-      new MutationObserver(Utils.debounce(function () {
+      // 工具条会随会话切换重建——保持圆圈在场。节流（带前缘）而非防抖：
+      // 防抖会被连续 DOM 变动不断重置，重建后圆圈迟迟不出现
+      new MutationObserver(Utils.throttle(function () {
         if (document.getElementById('dse-ctx-ring')) return;
         self.inject();
         // 用 _data（完整对象）重画——传 _last（数字）会走 update 的兜底分支，
         // 把构成估算数据清零；没有数据也要画（常驻 0%）
         self.update(self._data || self.emptyData());
-      }, 400)).observe(document.body, { childList: true, subtree: true });
+      }, 100)).observe(document.body, { childList: true, subtree: true });
       // 首帧即显示（开着自定义模型时）
       self.update(self._data || self.emptyData());
     });

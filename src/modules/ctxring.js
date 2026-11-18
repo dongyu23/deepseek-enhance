@@ -182,14 +182,15 @@ var CtxRing = {
         }
         if (e.path === 'demoCtxLimit' && self._data) { self.update(self._data); self.hidePanel(); }
       });
-      // 工具条会随会话切换重建——保持圆圈在场
-      new MutationObserver(Utils.debounce(function () {
+      // 工具条会随会话切换重建——保持圆圈在场。节流（带前缘）而非防抖：
+      // 防抖会被连续 DOM 变动不断重置，重建后圆圈迟迟不出现
+      new MutationObserver(Utils.throttle(function () {
         if (document.getElementById('dse-ctx-ring')) return;
         self.inject();
         // 用 _data（完整对象）重画——传 _last（数字）会走 update 的兜底分支，
         // 把构成估算数据清零；没有数据也要画（常驻 0%）
         self.update(self._data || self.emptyData());
-      }, 400)).observe(document.body, { childList: true, subtree: true });
+      }, 100)).observe(document.body, { childList: true, subtree: true });
       // 首帧即显示（开着自定义模型时）
       self.update(self._data || self.emptyData());
     });
