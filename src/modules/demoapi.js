@@ -35,15 +35,17 @@ var DemoApi = {
   /* ---------- 附件正文捕获（file_id → 文本） ----------
    * 页面把文件 POST 到 /anthropic/v1/files，响应只回 {id,size_bytes,filename,
    * mime_type}——没有正文。而 DeepSeek 明确不支持下载：GET .../files/{id} 只回
-   * 元数据，GET .../files/{id}/content 404（官方文档原话「上传的原始文件和解析
+   * 元数据、GET .../files/{id}/content 404（官方文档原话「上传的原始文件和解析
    * 结果都不支持下载」）。所以对话请求里的 document/file_id 块**只有 DeepSeek
    * 自己的模型认**，第三方模型收到就是死引用（StepFun 直接 400 input_invalid，
    * 且该 400 不带 CORS 头，浏览器只报 Failed to fetch）。
    * 但上传请求本身就经过这里，FormData 里躺着真正的 File——趁上传时把正文按
    * file_id 记下来，桥接再内联成文本块，附件就能在自定义模型下用了。
-   * 只记能当文本读的（txt/md/csv/代码/日志…），且有长度上限；图片/PDF/Office
-   * 记不下，桥接会换成一行说明，免得整条请求硬失败。 */
-  FILE_TEXT_CAP: 100000,
+   *
+   * 只收文本类文件，**不设长度上限**：PDF/图片/Office 的字节按 UTF-8 解出来
+   * 是乱码，硬塞给模型比给一行说明更糟，这是能力边界；而长度不该由我们截—
+   * —模型上下文装不下时接口会直接报错，那是诚实失败，静默截断反而会让模型
+   * 拿半份内容作答、还看不出少了什么（上下文圆圈会如实显示占用爆掉）。 */
   _fileTexts: {},
   _textExtRe: /\.(txt|md|csv|tsv|json|log|ya?ml|yml|ini|conf|cfg|html?|css|js|mjs|cjs|ts|tsx|jsx|py|go|java|c|cc|cpp|cxx|h|hpp|rs|rb|sh|bash|zsh|sql|xml|toml|dot|gv|proto|tex|bib|sty|cls|lisp|el|vim|r|lua|pl|pm|php|ps1|bat|cmd|awk|sed|make|mk|cmake|gradle|sbt|scala|kt|kts|swift|m|mm|dart|erl|hrl|ex|exs|clj|hs|lhs|ml|mli|fs|fsi|fsx|nim|cr|d|zig|v|sv|vhd|asm|s)$/i,
 
@@ -66,10 +68,7 @@ var DemoApi = {
         if (!DSE.config.get('demoCustom')) return;
         var looksText = /^text\//.test(type) || DemoApi._textExtRe.test(name);
         if (!looksText) return;
-        file.text().then(function (tx) {
-          rec.truncated = tx.length > DemoApi.FILE_TEXT_CAP;
-          rec.text = rec.truncated ? tx.slice(0, DemoApi.FILE_TEXT_CAP) : tx;
-        }).catch(function () {});
+        file.text().then(function (tx) { rec.text = tx; }).catch(function () {});
       };
       try {
         resp.clone().json().then(function (j) { bind(j && j.id); }, function () {});
