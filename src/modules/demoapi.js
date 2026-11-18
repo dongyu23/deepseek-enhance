@@ -83,35 +83,58 @@ var DemoApi = {
     };
   },
 
-  /* ---------- UI：注入官方设置弹窗（通用设置 tab 末尾） ---------- */
+  /* ---------- UI：注入官方设置弹窗（独立「自定义模型」tab） ---------- */
+  // 官方弹窗是左侧导航（通用设置/数据管理）+ 右侧内容容器的结构。我们把配置块
+  // 收进自建的第三个 tab：导航按钮插进左侧 rail，配置块作为内容容器的直接子
+  // 级（与原生行同为 flex 列子级，天然对齐）；tab 显隐自己管，不猜官方机制。
+  // 导航按钮直接复制原生按钮的 className（含构建哈希——运行时复制，官方重建
+  // 后自动跟随），激活态令牌从"激活/未激活"两个原生按钮的类名差里取。
   injectUI: function () {
     var dlg = document.querySelector('[class*="dialogMain-"]');
     if (!dlg) return;
-    // 锚点 = 当前可见的「通用设置最后一个分区」（主题/语言/朗读音色/位置信息，
-    // 前缀匹配——位置信息行全文是"位置信息请选择省份/地区请选择市"）。
-    // 要求可见：渲染中途/数据管理 tab 下通用分区是隐藏的，此时注入会落错位置
+    var self = this;
+    // 导航 = 含「通用设置/数据管理」文字的按钮的父容器；内容容器 = rail 兄弟
+    // 里那个 flex 列的容器（都不依赖哈希类名）
+    var navBtns = Array.prototype.filter.call(dlg.querySelectorAll('button'), function (b) {
+      var t = (b.textContent || '').replace(/\s/g, '');
+      return t === '通用设置' || t === '数据管理';
+    });
+    if (!navBtns.length) return;
+    var rail = navBtns[0].parentElement;
+    var content = null;
+    Array.prototype.forEach.call(rail.parentElement.children, function (c) {
+      if (!content && c !== rail && getComputedStyle(c).flexDirection === 'column') content = c;
+    });
+    if (!content) return;
+    // 锚点仍用于取官方行的计算样式（标签/控件配色）——弹窗默认开在通用设置，
+    // 该行可见；取不到就不注入（样式对齐优先）
     var anchor = null;
     Array.prototype.forEach.call(dlg.querySelectorAll('[class*="cell-"]'), function (c) {
       var t = (c.textContent || '').replace(/\s/g, '');
       if (/^(主题|语言|朗读音色|位置信息)/.test(t) && c.offsetParent !== null) anchor = c;
     });
+    if (!anchor) return;
     var existing = dlg.querySelector('[data-dse-api-wrap]');
-    if (!anchor) return;                       // 没有可见锚点：不注入（已有的留着，tab 同步会藏）
-    if (existing) {
-      // 位置自愈：React 重排（切 tab 等）会把外来节点挤到前面——不对就重注
-      if (existing.isConnected && existing.previousElementSibling === anchor) return;
-      existing.remove();
+    var navExisting = document.getElementById('dse-demo-tab');
+    if (existing && navExisting && existing.parentElement === content) {
+      if (this._tabCtl) this._tabCtl.sync();   // 已在位：只同步显隐状态
+      return;
     }
-    var refRow = anchor;
-    var content = anchor.parentElement;
-    if (!content) return;
+    if (existing) existing.remove();
+    if (navExisting) navExisting.remove();
+    // 上次注入绑定的监听/观察器先摘掉，避免重复累积
+    if (this._tabCtl) {
+      try { this._tabCtl.mo.disconnect(); } catch (e) {}
+      try { this._tabCtl.rail.removeEventListener('click', this._tabCtl.onNativeClick, true); } catch (e) {}
+      this._tabCtl = null;
+    }
     var pick = function (el, props) {
       var cs = getComputedStyle(el), o = {};
       props.forEach(function (p) { o[p] = cs[p]; });
       return o;
     };
-    var refLabel = refRow.querySelector('[class*="label-"]') || refRow;
-    var refCtrl = refRow.querySelector('button') || refRow;
+    var refLabel = anchor.querySelector('[class*="label-"]') || anchor;
+    var refCtrl = anchor.querySelector('button') || anchor;
     var labelCss = pick(refLabel, ['color', 'fontSize']);
     var ctrlCss = pick(refCtrl, ['backgroundColor', 'color']);
     // 注意 box-sizing：demo 的全局 reset 不覆盖注入节点，默认 content-box 会
@@ -383,23 +406,57 @@ var DemoApi = {
     };
     mkList('dse-model-hints', this.HINTS);
 
-    anchor.after(wrap);
-    //  tab 同步：锚定行（语言）被隐藏说明当前在数据管理 tab → 连同我们的行一起藏。
-    //  用锚定行可见性判断而非 tab 类名——不猜官方的隐藏机制
-    // tab 同步：当前 DOM 里找不到「语言」行（或它被隐藏）说明在数据管理 tab
-    // → 连同我们的行一起藏。每次重新查询——tab 切换时官方会移除/重建分区，
-    // 持有旧引用会因元素 detached 而永远判断为“该藏”
-    (function syncTab() {
-      if (!wrap.isConnected) return;
-      var lang = null;
-      Array.prototype.forEach.call(dlg.querySelectorAll('[class*="cell-"]'), function (r) {
-        if (lang) return;
-        var t = (r.textContent || '').replace(/\s/g, '');
-        if (t.indexOf('语言') !== -1 && t.length < 12) lang = r;
+    // 配置块作为内容容器的直接子级（与原生行同列，天然对齐）
+    content.appendChild(wrap);
+
+    /* ---------- 自建「自定义模型」tab ---------- */
+    // 导航按钮复制原生按钮的 className（构建哈希运行时复制，官方重建自动跟随）；
+    // 激活态令牌 = 激活按钮与未激活按钮类名差集里的那一项
+    var refNav = navBtns.filter(function (b) { return !/Active/.test(b.className); })[0] || navBtns[0];
+    var activeItem = navBtns.filter(function (b) { return /Active/.test(b.className); })[0] || null;
+    var activeToken = null;
+    if (activeItem && activeItem !== refNav) {
+      var at = activeItem.className.split(/\s+/), it = refNav.className.split(/\s+/);
+      activeToken = at.filter(function (t) { return t && it.indexOf(t) === -1; })[0] || null;
+    }
+    var nav = document.createElement('button');
+    nav.id = 'dse-demo-tab';
+    nav.type = 'button';
+    nav.className = refNav.className;
+    var navIco = document.createElement('span');
+    navIco.style.cssText = 'display:inline-flex;flex:0 0 auto';
+    navIco.innerHTML = this.ICON_TAB;
+    nav.appendChild(navIco);
+    nav.appendChild(document.createTextNode(DSE.t('自定义模型')));
+    rail.appendChild(nav);
+
+    var applyState = function (on) {
+      if (activeToken) {
+        nav.classList.toggle(activeToken, !!on);
+        // 只夺不还：原生 tab 的激活态由 React 自己管，我们开机时从原生激活项
+        // 手上摘掉令牌即可；点回原生 tab 时 React 会重新打上
+        if (on && activeItem) activeItem.classList.remove(activeToken);
+      }
+      Array.prototype.forEach.call(content.children, function (c) {
+        if (c === wrap) c.style.display = on ? '' : 'none';
+        else c.style.display = on ? 'none' : '';
       });
-      wrap.style.display = (!lang || lang.offsetParent === null) ? 'none' : '';
-      setTimeout(syncTab, 400);
-    })();
+    };
+    // 我们的 tab 被点 → 藏原生行、显示配置块
+    nav.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); applyState(true); });
+    // 原生 tab 被点（capture 先行于 React 处理器）→ 回到原生显隐
+    var onNativeClick = function (e) {
+      if (e.target === nav || (nav.contains && nav.contains(e.target))) return;
+      applyState(false);
+    };
+    rail.addEventListener('click', onNativeClick, true);
+    // React 重换内容子级时（重渲染/切 tab），我们的 tab 开着就立刻重新藏原生行
+    var mo = new MutationObserver(function () { if (ctl.on) applyState(true); });
+    mo.observe(content, { childList: true });
+    var ctl = { rail: rail, content: content, nav: nav, wrap: wrap, mo: mo, onNativeClick: onNativeClick, on: false,
+      sync: function () { if (ctl.on) applyState(true); } };
+    this._tabCtl = ctl;
+    applyState(false);
   },
 
   // demo 页左上角的应用名是纯文字“API 使用 demo”，与 DeepSeek 官方标识不一致。
@@ -407,6 +464,12 @@ var DemoApi = {
   // 对应静态文件、只存在于主站 bundle，故以资源文件随脚本分发、构建时内联。
   // SVG 的 fill 用 var(--dsw-alias-brand-primary)，该变量由标识元素自身携带
   // （#5686fe，官方主站同款），整套 markup 原样可用、无需替换颜色
+
+  // 自建 tab 的图标：官方「深度思考」原子图标（viewBox 0 0 14 14，原样提取），
+  // 渲染 16x16 与导航栏其他图标对齐
+  ICON_TAB: '<svg width="16" height="16" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+    '<path d="M7.06431 5.93342C7.68763 5.93342 8.19307 6.43904 8.19322 7.06233C8.19322 7.68573 7.68772 8.19123 7.06431 8.19123C6.44099 8.19113 5.9354 7.68567 5.9354 7.06233C5.93555 6.43911 6.44108 5.93353 7.06431 5.93342Z" fill="currentColor"></path>' +
+    '<path fill-rule="evenodd" clip-rule="evenodd" d="M8.6815 0.963693C10.1169 0.447019 11.6266 0.374829 12.5633 1.31135C13.5 2.24805 13.4277 3.75776 12.911 5.19319C12.7126 5.74431 12.4386 6.31796 12.0965 6.89729C12.4969 7.54638 12.8141 8.19018 13.036 8.80647C13.5527 10.2419 13.6251 11.7516 12.6883 12.6883C11.7516 13.625 10.242 13.5527 8.8065 13.036C8.19022 12.8141 7.54641 12.4969 6.89732 12.0965C6.31797 12.4386 5.74435 12.7125 5.19322 12.911C3.75777 13.4276 2.2481 13.5 1.31138 12.5633C0.374859 11.6266 0.447049 10.1168 0.963724 8.68147C1.17185 8.10338 1.46321 7.50063 1.82896 6.8924C1.52182 6.35711 1.27235 5.82825 1.08872 5.31819C0.572068 3.88278 0.499714 2.37306 1.43638 1.43635C2.37308 0.499655 3.8828 0.572044 5.31822 1.08869C5.82828 1.27232 6.35715 1.5218 6.89243 1.82893C7.50066 1.46318 8.10341 1.17181 8.6815 0.963693ZM11.3573 8.01154C10.9083 8.62253 10.3901 9.22873 9.80943 9.8094C9.22877 10.3901 8.62255 10.9083 8.01158 11.3572C8.4257 11.5841 8.8287 11.7688 9.21275 11.9071C10.5456 12.3868 11.4246 12.2547 11.8397 11.8397C12.2548 11.4246 12.3869 10.5456 11.9071 9.21272C11.7688 8.82866 11.5841 8.42568 11.3573 8.01154ZM2.56529 8.02912C2.37344 8.39322 2.21495 8.74796 2.09263 9.08772C1.61291 10.4204 1.74512 11.2995 2.16001 11.7147C2.57505 12.1297 3.45415 12.2618 4.78697 11.7821C5.11057 11.6656 5.44786 11.5164 5.7938 11.3367C5.249 10.9223 4.70922 10.4533 4.19029 9.9344C3.57578 9.31987 3.03169 8.67633 2.56529 8.02912ZM6.90708 3.2469C6.24065 3.70479 5.5646 4.26321 4.91392 4.91389C4.26325 5.56456 3.70482 6.24063 3.24693 6.90705C3.72674 7.63325 4.32777 8.37459 5.03892 9.08576C5.64943 9.69627 6.28183 10.2265 6.90806 10.6678C7.59368 10.2025 8.2908 9.63076 8.96079 8.96076C9.6308 8.29075 10.2025 7.59366 10.6678 6.90803C10.2265 6.2818 9.69631 5.6494 9.08579 5.03889C8.37462 4.32773 7.63328 3.72672 6.90708 3.2469ZM11.7147 2.15998C11.2996 1.74509 10.4204 1.61288 9.08775 2.0926C8.74835 2.21479 8.39382 2.37271 8.03013 2.56428C8.67728 3.03065 9.31995 3.5758 9.93443 4.19026C10.4534 4.7092 10.9223 5.24896 11.3368 5.79377C11.5164 5.44785 11.6656 5.11052 11.7821 4.78694C12.2618 3.45416 12.1297 2.57502 11.7147 2.15998ZM4.91197 2.2176C3.57922 1.73788 2.70004 1.86995 2.28501 2.28498C1.87001 2.70003 1.73791 3.5792 2.21763 4.91194C2.31709 5.18822 2.44112 5.47427 2.58677 5.7674C3.01931 5.1887 3.51474 4.6158 4.06529 4.06526C4.61584 3.5147 5.18872 3.01928 5.76743 2.58674C5.47431 2.4411 5.18824 2.31706 4.91197 2.2176Z" fill="currentColor"></path></svg>',
   OFFICIAL_LOGO: '__DSE_LOGO_SVG__',
 
   fixLogo: function () {
