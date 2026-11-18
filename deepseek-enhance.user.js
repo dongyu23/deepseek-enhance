@@ -2,7 +2,7 @@
 // @name         DeepSeek Enhance 深度增强
 // @name:en      DeepSeek Enhance
 // @namespace    https://github.com/Hiweny/deepseek-enhance
-// @version      8.8.8
+// @version      8.9.0
 // @description  气泡材质(默认iOS磨砂)/思考自动折叠/代码块自动折叠/中英文界面/Markdown本地美化/LaTeX/图片URL背景/顶栏背景透出/按会话隔离的系统提示词(新对话可先填后发)/防撤回/上下文用量/消息导航(虚拟列表适配)/输入框磨砂/移动端适配
 // @updateURL    https://raw.githubusercontent.com/dongyu23/deepseek-enhance/main/deepseek-enhance.meta.js
 // @downloadURL  https://raw.githubusercontent.com/dongyu23/deepseek-enhance/main/deepseek-enhance.user.js
@@ -106,7 +106,7 @@ var Bridge = {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DSE = window.DSE = {
-  version: '8.8.8',
+  version: '8.9.0',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   bridge: Bridge,
   modules: {},
@@ -3861,7 +3861,13 @@ var DemoBridge = {
     var buf = '';
     return (async function () {
       while (true) {
-        if (signal && signal.aborted) { try { reader.cancel(); } catch (e) {} throw new DOMException('Aborted', 'AbortError'); }
+        if (signal && signal.aborted) {
+          // cancel() 返回 promise，流已 abort 时它会 reject——不接就是 unhandled
+          // rejection（每次劫持搜索都往控制台抛一条 "BodyStreamBuffer was
+          // aborted"）。try/catch 只拦同步抛，接不住 promise 拒绝
+          try { reader.cancel().catch(function () {}); } catch (e) {}
+          throw new DOMException('Aborted', 'AbortError');
+        }
         var r = await reader.read();
         if (r.done) break;
         buf += dec.decode(r.value, { stream: true });
@@ -3881,6 +3887,23 @@ var DemoBridge = {
     })();
   },
 
+  /* ---------- 从模型的工具调用意图里取出查询词 ---------- */
+  // 意图块有三种形状（服务端 server_tool_use / 客户端 tool_use / DeepSeek 方言），
+  // 且模型在历史里见过合成块后有概率把 queries 写成字符串化的数组。统一在这里
+  // 归一，调用方只管拿字符串
+  firstQuery: function (intent) {
+    if (!intent || typeof intent !== 'object') return '';
+    var o = intent.input && typeof intent.input === 'object' ? intent.input : intent;
+    var qs = o.queries;
+    if (typeof qs === 'string') {
+      // 字符串化的数组：按数组解析；解析不动就整串当查询词
+      try { var p = JSON.parse(qs); if (Array.isArray(p) && p.length) qs = p; } catch (e) {}
+      if (typeof qs === 'string') return qs.trim();
+    }
+    if (Array.isArray(qs) && qs.length) return String(qs[0] || '').trim();
+    return String(o.query || '').trim();
+  },
+
   /* ---------- DeepSeek 独立搜索腿（searchapi 模式：只付搜索费） ---------- */
   // 直调 POST https://api.deepseek.com/v1/tools/search（Bearer 鉴权，用页面里
   // 同一把 DeepSeek Key），不发起模型对话——没有模型 token 费，只按次计搜索
@@ -3888,13 +3911,13 @@ var DemoBridge = {
   // server_tool_use / web_search_tool_result 块：一份推给界面，一份由调用方
   // 塞回请求历史当模型的 grounding。
   //
-  // 块内字段取舍（照官方真实块定，非自造）：官方 web_search_result 的 snippet
-  // 实测只有 95–182 字，所以 snippet 仍用短摘要、界面与原生一致；网页全文放
-  // 在额外的 content 字段里——界面不渲染它（只取已知字段），但模型在历史里
-  // 读得到，于是不必再单独读网页。这也是 searchapi 模式不再提供 read_url 的
-  // 原因：官方那套是「搜索给摘要 + read_url 补全文」，而 StepFun 没有服务端
-  // 读网页工具可劫持（web_fetch_20250305 实测 400），与其留一个模型会漏用的
-  // 客户端 read_url，不如让搜索一次带全文
+  // 只做字段搬运，不加料：块里只有官方 web_search_result 本就有的那几个字段
+  // （type/title/url/snippet/site_name/site_icon/page_age），snippet 直接用
+  // 接口回的摘要。曾把网页全文塞进额外的 content 字段让模型"不必再读网页"——
+  // 那是我们自己加的东西，官方协议里没有，已删（2026-11-18 用户指出"我让你
+  // 做的只有转发、路由"）。于是 searchapi 只有搜索、没有读网页：官方那对是
+  // 「搜索给摘要 + read_url 补全文」，而 StepFun 没有服务端读网页工具可劫持
+  // （web_fetch_20250305 实测 400），与其加料不如让模型自己决定再搜几次
   runLegSearchApi: function (query, dsKey, push, nextIdx, signal) {
     var self = this;
     var q = String(query || '').slice(0, 128);
@@ -3905,7 +3928,7 @@ var DemoBridge = {
     return this.nativeFetch()('https://api.deepseek.com/v1/tools/search', {
       method: 'POST', signal: ac.signal,
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + dsKey },
-      body: JSON.stringify({ query: q, count: 10, need_content: true })
+      body: JSON.stringify({ query: q, count: 10, need_content: false })
     }).then(function (resp) {
       clearTimeout(timer);
       if (!resp.ok) throw new Error('search api http ' + resp.status);
@@ -3915,9 +3938,8 @@ var DemoBridge = {
       var i1 = nextIdx(), i2 = nextIdx();
       var items = ((j && j.results) || []).slice(0, 10).map(function (r) {
         return { type: 'web_search_result', title: r.title || '', url: r.url || '',
-          snippet: String(r.snippet || r.summary || '').slice(0, 400),
-          site_name: r.site_name || '', site_icon: r.site_icon || '', page_age: r.date || '',
-          content: String(r.content || r.snippet || r.summary || '').slice(0, self.LEG_TEXT_CAP) };
+          snippet: r.snippet || r.summary || '', site_name: r.site_name || '',
+          site_icon: r.site_icon || '', page_age: r.date || '' };
       });
       var useBlock = { type: 'server_tool_use', id: id, name: 'deepseek_web_search', kind: 'search',
         input: { action: 'search', queries: [q] } };
@@ -3954,7 +3976,10 @@ var DemoBridge = {
     var messages = o.messages.slice();
     var stopReason = 'end_turn', lastUsage = null, respModel = '';
     var acc = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
-    var CONTINUE = '请基于上面的搜索结果回答。';
+    // 官方「深度思考」开关。关着时官方端点不回思考块，这里也把第三方模型的
+    // 思考块丢掉——StepFun 忽略 thinking:{disabled} 照样回思考，原样转发等于
+    // 用户关着开关却看到满屏思考（还常是英文 Meta 独白），那是我们多加的
+    var thinkOn = !!o.thinkOn;
     return (async function () {
       while (true) {
         if (o.ac.signal.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -3974,33 +3999,44 @@ var DemoBridge = {
           return { stopReason: 'end_turn', usage: acc, lastUsage: null, model: '', messages: messages };
         }
         var intent = null, openIdx = -1, curType = '', partial = '', aborted = false;
+        // 意图块有两种形状：声明服务端工具时模型吐 server_tool_use；但历史里
+        // 一旦出现我们合成的 server_tool_use 块，模型有概率改吐客户端形状的
+        // tool_use（实测：某一轮突然变成 tool_use，stop_reason=tool_use）。两种
+        // 都要当意图接住，否则那一轮会被当成"答完了"直接返回，页面挂在生成中、
+        // 答案只剩搜索前那一句话（2026-11-18 实测踩到）
+        var isIntent = function (t) { return t === 'server_tool_use' || t === 'tool_use'; };
         await self.pump(resp.body, function (j) {
           if (j.type === 'message_start' && j.message && j.message.model) respModel = j.message.model;
           if (j.type === 'content_block_start') {
             var cb = j.content_block || {};
-            curType = cb.type; partial = ''; openIdx = j.index;
-            // 服务端工具的意图块不转发——它会被我们自己的合成块取代；文本/思考
-            // 照常实时转发（原生也是先流思考再搜索）
-            if (cb.type === 'text' || cb.type === 'thinking') {
-              o.push(self.sseEvent('content_block_start', { type: 'content_block_start', index: j.index, content_block: cb }));
+            curType = cb.type; partial = ''; openIdx = -1;
+            // index 必须走统一的 nextIdx()：早先直接转发上游的 j.index，而合成
+            // 块用另一套计数器——两套编号撞车，demo 按 index 存块时互相覆盖，
+            // 存进库的消息会丢掉整段搜索（实测 3 次搜索只剩 1 组块）
+            // 意图块不转发、也**不占用 index**：吞掉 START 却仍推 STOP 是畸形
+            // SSE，页面解析到就停止累积，后面所有搜索块整段丢失（实测 5 次搜索
+            // 只存进 1 组）
+            if (cb.type === 'text' || (cb.type === 'thinking' && thinkOn)) {
+              openIdx = o.nextIdx();
+              o.push(self.sseEvent('content_block_start', { type: 'content_block_start', index: openIdx, content_block: cb }));
             }
           } else if (j.type === 'content_block_delta') {
             var d = j.delta || {};
             if (d.type === 'input_json_delta') {
-              if (curType === 'server_tool_use') partial += d.partial_json || '';
+              if (isIntent(curType)) partial += d.partial_json || '';
               return;
             }
             if (d.type === 'text_delta' || d.type === 'thinking_delta' || d.type === 'signature_delta') {
-              if (openIdx >= 0 && (curType === 'text' || curType === 'thinking')) {
+              if (openIdx >= 0 && (curType === 'text' || (curType === 'thinking' && thinkOn))) {
                 o.push(self.sseEvent('content_block_delta', { type: 'content_block_delta', index: openIdx, delta: d }));
               }
             }
           } else if (j.type === 'content_block_stop') {
-            if (curType === 'server_tool_use' && !aborted) {
+            if (isIntent(curType) && !aborted) {
               aborted = true;
               try { intent = JSON.parse(partial || '{}'); } catch (e) { intent = {}; }
               roundAc.abort();     // 拿到完整查询词立刻断，结果块不会漏给模型
-            } else if (openIdx >= 0 && (curType === 'text' || curType === 'thinking')) {
+            } else if (openIdx >= 0 && (curType === 'text' || (curType === 'thinking' && thinkOn))) {
               o.push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: openIdx }));
               openIdx = -1;
             }
@@ -4021,13 +4057,34 @@ var DemoBridge = {
         if (openIdx >= 0) {
           o.push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: openIdx }));
         }
-        var q = intent && (intent.query || (intent.queries && intent.queries[0]));
-        if (!q) return { stopReason: stopReason, usage: acc, lastUsage: lastUsage, model: respModel, messages: messages };
+        // 查询词兼容三种形状：服务端工具的 {query}、DeepSeek 方言的
+        // {action:'search',queries:[..]}、客户端工具的 {query}。
+        // 坑：模型一旦在历史里见过我们合成的 DeepSeek 方言块，有概率把 queries
+        // 写成**字符串化的数组**（实测 "[\"黄仁勋 NVIDIA 消息\"]"）——此时
+        // queries[0] 取到的是字符串第 0 个字符 "["，整次搜索就废了。必须先按
+        // 数组解析，解析不动才整串当查询词
+        var q = self.firstQuery(intent);
+        if (!q) {
+          // 模型说"我要调工具"却一个可执行的搜索意图都没给出——不能悄悄当答完
+          // （页面会永远转圈、答案只剩搜索前那句话），把错误显式推给界面
+          if (stopReason === 'tool_use') {
+            o.push(self.sseEvent('error', { type: 'error', error: { type: 'api_error',
+              message: '模型请求了工具调用但未给出可执行的搜索关键词，已中止本次回答' } }));
+          }
+          return { stopReason: stopReason, usage: acc, lastUsage: lastUsage, model: respModel, messages: messages };
+        }
         var leg = await self.runLegSearchApi(q, o.dsKey, o.push, o.nextIdx, o.ac.signal);
-        messages = messages.concat([
-          { role: 'assistant', content: leg.blocks },
-          { role: 'user', content: CONTINUE }
-        ]);
+        // 新块并进**同一条** assistant 消息——原生就是一条 assistant 消息里串着
+        // 一次次搜索的块；追加成两条连续 assistant 消息多数 provider 不接受。
+        // 也不补任何 user 收尾消息：补一句"请基于上面的搜索结果回答"等于替用户
+        // 决定"别再搜了"，用户明说"搜索5次"也会被这句话按死（2026-11-18 实测
+        // 踩到）。模型自己判断够不够，想再搜就再截一次
+        var last = messages[messages.length - 1];
+        if (last && last.role === 'assistant' && Array.isArray(last.content)) {
+          last.content = last.content.concat(leg.blocks);
+        } else {
+          messages.push({ role: 'assistant', content: leg.blocks });
+        }
       }
     })();
   },
@@ -4282,7 +4339,10 @@ var DemoBridge = {
           // 负责换执行者。两条路都不设轮数上限，停止一律交给页面停止按钮
           var sa = await self.flowSearchApi({
             messages: messages, url: outbound.url, headers: outbound.headers, body: outbound.body,
-            push: push, nextIdx: nextIdx, ac: ac, dsKey: dsKey
+            push: push, nextIdx: nextIdx, ac: ac, dsKey: dsKey,
+            // 「深度思考」开关：官方关着时端点不回思考块，这里也跟着丢，别把
+            // 第三方模型（忽略 thinking:disabled）硬回来的思考展示给用户
+            thinkOn: !!(body.thinking && body.thinking.type === 'enabled')
           });
           stopReason = sa.stopReason; roundUsage = sa.lastUsage; respModel = sa.model;
           messages = sa.messages;
