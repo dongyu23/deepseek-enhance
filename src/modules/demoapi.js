@@ -189,11 +189,13 @@ var DemoApi = {
     var ctrlCss = pick(refCtrl, ['backgroundColor', 'color']);
     // 注意 box-sizing：demo 的全局 reset 不覆盖注入节点，默认 content-box 会
     // 让 60px 的行变成 84px（padding 外加）——与官方行观感不一致
-    var rowBase = 'display:flex;align-items:center;gap:8px;box-sizing:border-box;min-height:60px;padding:12px 0;font-size:14px';
-    var ctrlStyle = 'box-sizing:border-box;width:240px;height:36px;border:none;outline:none;border-radius:18px;padding:0 14px;' +
+    // 紧凑规格：行高从 60px 收到 44px、控件 36→32px、说明行 12→11px。
+    // 这一屏有 6 行 + 2 条说明，按原规格设置面板要滚好长才能看到「高级选项」
+    var rowBase = 'display:flex;align-items:center;gap:8px;box-sizing:border-box;min-height:44px;padding:6px 0;font-size:14px';
+    var ctrlStyle = 'box-sizing:border-box;width:240px;height:32px;border:none;outline:none;border-radius:16px;padding:0 14px;' +
       'font-size:14px;background:' + (ctrlCss.backgroundColor || 'rgba(127,127,127,.18)') + ';' +
       'color:' + (ctrlCss.color || 'inherit');
-    var descStyle = 'box-sizing:border-box;font-size:12px;line-height:1.5;opacity:.55;padding:0 0 6px';
+    var descStyle = 'box-sizing:border-box;font-size:11px;line-height:1.4;opacity:.55;padding:0 0 3px';
 
     var self = this;
     var mkRow = function (labelText, cfgKey, placeholder, title, isPassword, hints, listId) {
@@ -211,14 +213,17 @@ var DemoApi = {
       input.value = self.cfg(cfgKey);
       input.title = title;
       input.style.cssText = ctrlStyle;
+      // 即改即存（输入 300ms 防抖、失焦立即）。commit 挂到 input._dseCommit 上，
+      // 底部「保存」按钮靠它冲掉还没落盘的防抖值
+      var commit = function () { DSE.config.set(self.KEYS[cfgKey], input.value.trim()); };
+      input._dseCommit = commit;
       input.addEventListener('input', function () {
         clearTimeout(input._dseT);
-        var v = input.value.trim();
-        input._dseT = setTimeout(function () { DSE.config.set(self.KEYS[cfgKey], v); }, 300);
+        input._dseT = setTimeout(function () { input._dseT = null; commit(); }, 300);
       });
       input.addEventListener('blur', function () {
-        clearTimeout(input._dseT);
-        DSE.config.set(self.KEYS[cfgKey], input.value.trim());
+        clearTimeout(input._dseT); input._dseT = null;
+        commit();
       });
       row.appendChild(label);
       row.appendChild(input);
@@ -331,6 +336,40 @@ var DemoApi = {
     cfgBox.appendChild(withDesc(mkRow('API Key', 'key', DSE.t('（用页面里填的官方 Key）'), KEY_DESC, true), KEY_DESC));
     cfgBox.appendChild(mkRow('模型', 'model', DSE.t('deepseek-flash（官方默认）'),
       DSE.t('留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段'), false, DemoApi.HINTS, 'dse-model-hints'));
+
+    /* ---------- 保存按钮（放在主字段下方、测试行之前：一眼可见，不用滚动） ----------
+     * 这些项本来就是即改即存（输入 300ms 防抖、下拉 change 即时、失焦立即），
+     * 但用户看不出来，也不确定直接关掉设置会不会丢——于是给一个显式「保存」：
+     * 点一下冲掉所有未落盘的防抖写入、立即写盘并反馈；左边一句「改动会自动保存」
+     * 把真实行为说明白，关不关面板都不会丢 */
+    var saveRow = document.createElement('div');
+    saveRow.setAttribute('data-dse-api-row', 'save');
+    saveRow.style.cssText = rowBase + 'margin-top:2px';
+    var saveHint = document.createElement('div');
+    saveHint.textContent = DSE.t('改动会自动保存，关掉面板也不会丢；点此可立即保存并确认');
+    saveHint.style.cssText = 'flex:1;font-size:11px;line-height:1.4;opacity:.6;padding-right:8px';
+    var saveBtn = document.createElement('button');
+    saveBtn.type = 'button';
+    saveBtn.textContent = DSE.t('保存');
+    var saveAccent = getComputedStyle(document.documentElement).getPropertyValue('--dse-accent').trim() || '#3b6cf6';
+    saveBtn.style.cssText = 'box-sizing:border-box;height:32px;border:none;outline:none;cursor:pointer;' +
+      'border-radius:16px;padding:0 20px;font-size:13px;background:' + saveAccent + ';color:#fff;flex:0 0 auto';
+    var saveBtnTimer = null;
+    saveBtn.addEventListener('click', function () {
+      // 冲掉未落盘的防抖写入（刚打完字还没到 300ms 的情况）
+      cfgBox.querySelectorAll('input').forEach(function (inp) {
+        if (inp._dseT) { clearTimeout(inp._dseT); inp._dseT = null; }
+        if (typeof inp._dseCommit === 'function') inp._dseCommit();
+      });
+      DSE.config.save();
+      Utils.toast(DSE.t('已保存'), 1500);
+      saveBtn.textContent = DSE.t('已保存 ✓');
+      clearTimeout(saveBtnTimer);
+      saveBtnTimer = setTimeout(function () { saveBtn.textContent = DSE.t('保存'); }, 1600);
+    });
+    saveRow.appendChild(saveHint);
+    saveRow.appendChild(saveBtn);
+    cfgBox.appendChild(saveRow);
     // 模型测试：一发极小请求验证端点/Key/模型是否可用，并让模型自述身份——
     // DeepSeek 会答"我是DeepSeek"，第三方模型会答出自己的真实身份，用户据此
     // 确认切换真的生效了
@@ -344,11 +383,11 @@ var DemoApi = {
     testBtn.type = 'button';
     testBtn.textContent = DSE.t('测试');
     var accent = getComputedStyle(document.documentElement).getPropertyValue('--dse-accent').trim() || '#3b6cf6';
-    testBtn.style.cssText = 'box-sizing:border-box;height:36px;border:none;outline:none;cursor:pointer;' +
-      'border-radius:18px;padding:0 20px;font-size:14px;background:' + accent + ';color:#fff;flex:0 0 auto';
+    testBtn.style.cssText = 'box-sizing:border-box;height:32px;border:none;outline:none;cursor:pointer;' +
+      'border-radius:16px;padding:0 18px;font-size:13px;background:' + accent + ';color:#fff;flex:0 0 auto';
     var testResult = document.createElement('div');
     testResult.setAttribute('data-dse-test-result', '1');
-    testResult.style.cssText = 'display:none;box-sizing:border-box;font-size:12px;line-height:1.6;padding:2px 0 8px;white-space:pre-wrap;word-break:break-all';
+    testResult.style.cssText = 'display:none;box-sizing:border-box;font-size:11px;line-height:1.5;padding:1px 0 6px;white-space:pre-wrap;word-break:break-all';
     testBtn.addEventListener('click', function () {
       testResult.style.display = 'block';
       testResult.style.color = 'inherit';
@@ -432,8 +471,8 @@ var DemoApi = {
     advBox.appendChild(withDesc(mkSelect('起名来源', 'titleSource',
       [['deepseek', 'deepseek：官方起名腿'], ['model', 'model：自定义模型起名'], ['off', 'off：用首条消息截断']], 'deepseek', TITLE_SOURCE_TITLE), TITLE_SOURCE_DESC));
     advBox.appendChild(withDesc(mkRow('上下文窗口', 'ctxLimit', '128000',
-      DSE.t('所用模型的上下文窗口（tokens）。输入框旁的圆圈按 占用/窗口 显示百分比'), false, null, null),
-      DSE.t('所用模型的上下文窗口（tokens）。输入框旁的圆圈按 占用/窗口 显示百分比')));
+      DSE.t('所用模型的上下文窗口（tokens）。可填 128000，也可写 128k / 1m。输入框旁的圆圈按 占用/窗口 显示百分比'), false, null, null),
+      DSE.t('所用模型的上下文窗口（tokens）。可填 128000，也可写 128k / 1m。输入框旁的圆圈按 占用/窗口 显示百分比')));
     advBox.appendChild(withDesc(mkSelect('Key 请求头', 'keyHeader',
       [['x-api-key', 'x-api-key（默认）'], ['authorization', 'authorization（Bearer）']], 'x-api-key'),
       '个别网站（如 StepFun）的浏览器安全策略只认 Authorization 请求头，连不上时改选 authorization'));

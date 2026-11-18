@@ -392,7 +392,16 @@ var DemoBridge = {
     }).then(function (resp) {
       if (!resp.ok) return resp.text().then(function (t) { throw new Error('leg http ' + resp.status + ': ' + t.slice(0, 200)); });
       var out = { blocks: [], text: '', usage: null };
+      // 同主流程：input 类 usage 可能只在 message_start 给
+      var mergeLegUsage = function (u) {
+        if (!u) return;
+        out.usage = out.usage || {};
+        ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'].forEach(function (k) {
+          if (typeof u[k] === 'number' && (out.usage[k] == null || u[k] > 0)) out.usage[k] = u[k];
+        });
+      };
       return self.pump(resp.body, function (j) {
+        if (j.type === 'message_start' && j.message) mergeLegUsage(j.message.usage);
         if (j.type === 'content_block_start') {
           var cb = j.content_block || {};
           var b = { index: nextIdx(), raw: cb, fwd: false };
@@ -415,7 +424,7 @@ var DemoBridge = {
           var b2 = out.blocks[out.blocks.length - 1];
           if (b2 && b2.fwd) push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: b2.index }));
         } else if (j.type === 'message_delta') {
-          out.usage = j.usage || out.usage;
+          mergeLegUsage(j.usage);
         }
       }, ac.signal).then(function () { clearTimeout(timer); return out; });
     }).catch(function (e) {
@@ -511,8 +520,20 @@ var DemoBridge = {
           var blocks = [];       // 本轮完整块（供下一轮历史）
           var partial = {};      // index → 累积 input_json
           var roundUsage = null, roundStop = 'end_turn', respModel = '';
+          // usage 合并：Anthropic 系把 input 类放在 message_start.message.usage、
+          // output 放在 message_delta.usage，很多第三方端点只给其中一个——
+          // 以前只读 message_delta，遇到「只在 message_start 给 input_tokens」
+          // 的端点就算出 used=0，圆圈永远显示 0%。这里按字段合并，0 不覆盖已有值
+          var mergeUsage = function (u) {
+            if (!u) return;
+            roundUsage = roundUsage || {};
+            ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'].forEach(function (k) {
+              if (typeof u[k] === 'number' && (roundUsage[k] == null || u[k] > 0)) roundUsage[k] = u[k];
+            });
+          };
           await self.pump(resp.body, function (j) {
             if (j.type === 'message_start' && j.message && j.message.model) respModel = j.message.model;
+            if (j.type === 'message_start' && j.message) mergeUsage(j.message.usage);
             if (j.type === 'content_block_start') {
               var cb = j.content_block || {};
               var b = { type: cb.type, raw: cb, index: nextIdx() };
@@ -538,7 +559,7 @@ var DemoBridge = {
                 push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: b2.index }));
               }
             } else if (j.type === 'message_delta') {
-              roundUsage = j.usage || roundUsage;
+              mergeUsage(j.usage);
               if (j.delta && j.delta.stop_reason) roundStop = j.delta.stop_reason;
             }
           }, ac.signal);

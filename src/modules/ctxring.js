@@ -5,15 +5,32 @@
  * （input + cache_read + cache_creation = 本次请求模型实际收到的全部
  * 内容：系统提示/工具定义/完整历史——非文本估算），经 'ctx:api' 事件
  * 广播。本模块只负责把占用/窗口画成一个环，注入在输入工具条里、
- * 发送按钮一侧。常驻显示：开着自定义模型就在（首次对话前显示 0%），
- * 交换后变精确值；关闭总开关才隐藏。
+ * 发送按钮一侧。常驻显示：配了第三方端点（桥接活动）就在（首次对话前显示
+ * 0%），总开关关、或端点是官方/未配（桥接不跑、永远没有数据）时隐藏。
  * ============================================================ */
 var CtxRing = {
   SIZE: 22, R: 8.5,
 
+  // 解析「上下文窗口」输入：支持 128000 / 128k / 1m / 1M 等写法（大小写不敏感，
+  // 容忍逗号空格和 tokens 后缀）。以前直接 parseInt——用户按习惯打 "1m" 会被解析
+  // 成 1，窗口变成 1 token，圆圈瞬间 100% 变红、浮层显示 "35K/1（100.0%）"，
+  // 而用户只是想扩展到 1M（2026-11-18 实测复现）。解析不出来返回 0，由 limit() 回退
+  parseLimit: function (raw) {
+    if (typeof raw === 'number') return (isFinite(raw) && raw > 0) ? Math.floor(raw) : 0;
+    var s = String(raw == null ? '' : raw).trim().toLowerCase()
+      .replace(/[,\s_]/g, '').replace(/tokens?$/, '');
+    if (!s) return 0;
+    var m = s.match(/^(\d+(?:\.\d+)?)(k|m)?$/);
+    if (!m) return 0;
+    var n = parseFloat(m[1]);
+    if (m[2] === 'k') n *= 1e3;
+    else if (m[2] === 'm') n *= 1e6;
+    return (isFinite(n) && n > 0) ? Math.floor(n) : 0;
+  },
+
   limit: function () {
-    var v = parseInt(DSE.config.get('demoCtxLimit'), 10);
-    return (v > 0) ? v : 128000;
+    var v = this.parseLimit(DSE.config.get('demoCtxLimit'));
+    return v > 0 ? v : 128000;
   },
 
   fmt: function (n) {
@@ -54,6 +71,18 @@ var CtxRing = {
     return btn;
   },
 
+  // 圆圈能不能显示：总开关开着【且桥接真的在跑】。桥接只在配了第三方
+  // （非 deepseek.com）端点时才活动——开着自定义模型但用的是官方端点时，
+  // 请求原生透传、ctx:api 永远不来，圆圈就是个永远 0% 的装饰。
+  // 实测（2026-11-18 官网 demo 页）：官方端点下 message_start/message_delta
+  // 的 usage 都是全的，但桥接不跑所以一个字都拿不到——这种「看得见却永远
+  // 是 0」比不显示更糟，故与设置面板同一思路：不适用就隐藏
+  canShow: function () {
+    if (!DSE.config.get('demoCustom')) return false;
+    var B = DSE.modules.demoBridge;
+    return !!(B && typeof B.active === 'function' && B.active());
+  },
+
   update: function (data) {
     var self = this;   // 必须在方法内捕获——裸 self 会解析到浏览器全局 window.self
     // 注意 used===0 的判定：早先用 `data.used ? data.used : data`，0 是 falsy
@@ -71,7 +100,7 @@ var CtxRing = {
     if (arc) arc.setAttribute('stroke-dashoffset', (C * (1 - pct / 100)).toFixed(2));
     // 颜色分级：>90% 危险 / >70% 警告（与设置面板的 ctx 分级一致）
     arc.setAttribute('stroke', pct >= 90 ? '#f87171' : (pct >= 70 ? '#fbbf24' : 'var(--dse-accent)'));
-    btn.style.display = DSE.config.get('demoCustom') ? 'inline-flex' : 'none';
+    btn.style.display = this.canShow() ? 'inline-flex' : 'none';
     // 富信息悬浮面板替代原生 title
     btn.onmouseenter = function () { self.showPanel(); };
     btn.onmouseleave = function () { self.hidePanel(); };
@@ -219,18 +248,23 @@ var CtxRing = {
       self.update(self._data || self.emptyData());
       bindPrecise();
       DSE.on('ctx:api', function (p) { if (p && p.used > 0) self.update(p); });
-      // 常驻显隐由总开关决定：关→隐藏；开→立刻显示（没数据时 0%），不必等
-      // 首次对话——用户要求圆圈一直显示
+      // 常驻显隐由「总开关 + 桥接是否活动」共同决定：关→隐藏；开且桥接在跑
+      // （配了第三方端点）→立刻显示（没数据时 0%），不必等首次对话；
+      // demoCustom 开着但端点是官方/未配时桥接不跑，圆圈永远拿不到数据，
+      // 那种情况下隐藏（见 canShow 注释）
       DSE.on('cfg:change', function (e) {
-        if (e.path === 'demoCustom') {
-          if (e.value) self.update(self._data || self.emptyData());
-          else {
-            var b = document.getElementById('dse-ctx-ring');
-            if (b) b.style.display = 'none';
-            self.hidePanel();
-          }
+        if (e.path === 'demoCustom' || e.path === 'demoEndpoint' || e.path === 'demoBridge') {
+          self.update(self._data || self.emptyData());
+          if (!self.canShow()) self.hidePanel();
         }
-        if (e.path === 'demoCtxLimit' && self._data) { self.update(self._data); self.hidePanel(); }
+        if (e.path === 'demoCtxLimit') {
+          // 输入改不动的（比如把 128k 打成 128x）要给个反馈，否则用户只会看到
+          // 百分比毫无变化、以为脚本坏了
+          if (String(DSE.config.get('demoCtxLimit') || '').trim() && !self.parseLimit(DSE.config.get('demoCtxLimit'))) {
+            Utils.toast(DSE.t('上下文窗口无法识别「{v}」，已按 128K 计算。可填 128000 / 128k / 1m', { v: String(DSE.config.get('demoCtxLimit')).slice(0, 20) }), 3600);
+          }
+          if (self._data) { self.update(self._data); self.hidePanel(); }
+        }
       });
       // 工具条会随会话切换重建——保持圆圈在场。节流（带前缘）而非防抖：
       // 防抖会被连续 DOM 变动不断重置，重建后圆圈迟迟不出现

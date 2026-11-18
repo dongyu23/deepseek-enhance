@@ -156,14 +156,22 @@ var AntiRecall = {
   },
 
   // 历史回放：status=CONTENT_FILTER 的消息用本地缓存替换（照搬 v7.2）+ 智能对账
+  // 字符串入口：站点默认 responseType=text，读的是 responseText。没改过就原样
+  // 返回原文（不重新序列化，避免无谓的字节级差异）
   processHistoryJSON: function (rawText, sid) {
+    var json;
+    try { json = JSON.parse(rawText); } catch (e) { return rawText; }
+    return this.processHistoryObj(json, sid) ? JSON.stringify(json) : rawText;
+  },
+  // 对象入口：站点若用 responseType=json，读的是 response（对象）——以前这里
+  // 整段 return，撤回内容不替换、history:loaded 也不发。原地改写，返回是否改过
+  processHistoryObj: function (json, sid) {
     var AR = this;
     try {
-      var json = JSON.parse(rawText);
-      if (!json.data || !json.data.biz_data) return rawText;
+      if (!json.data || !json.data.biz_data) return false;
       var data = json.data.biz_data;
       var sessId = (data.chat_session && data.chat_session.id) || sid || '';
-      if (!data.chat_messages) return rawText;
+      if (!data.chat_messages) return false;
       var modified = false;
       var serverTexts = {};
       for (var i = 0; i < data.chat_messages.length; i++) {
@@ -182,9 +190,10 @@ var AntiRecall = {
           h.serverHas = true; modified = true;
         }
       });
-      if (modified) { DSE.config.saveSessions(); json.data.biz_data = data; return JSON.stringify(json); }
+      if (modified) DSE.config.saveSessions();
+      return modified;
     } catch (e) {}
-    return rawText;
+    return false;
   },
 
   /* ================= XHR 挂载层（照搬 v7.2 结构，链式包在 net 之外） ================= */
@@ -245,11 +254,23 @@ var AntiRecall = {
             configurable: true, enumerable: true,
             get: function () {
               var raw = _origRespGetter.call(xhr);
-              if (typeof raw !== 'string') return raw;
-              if (isGen && state) return AR.processSSEStream(String(raw), state).text;
+              if (isGen && state) {
+                if (typeof raw !== 'string') return raw;
+                return AR.processSSEStream(String(raw), state).text;
+              }
               if (isHist) {
-                var t = DSE.net.handleHistory(raw, xhr._dseCtx || { url: url, isHistory: true });
-                return AR.processHistoryJSON(t, sid);
+                if (typeof raw === 'string') {
+                  var t = DSE.net.handleHistory(raw, xhr._dseCtx || { url: url, isHistory: true });
+                  return AR.processHistoryJSON(t, sid);
+                }
+                // responseType='json'：站点读的是对象。以前 typeof raw !== 'string'
+                // 就整段放行，撤回不替换、history:loaded 不发——用量统计在这种
+                // 站点行为下永远显示 0
+                if (raw && typeof raw === 'object') {
+                  var o = DSE.net.handleHistory(raw, xhr._dseCtx || { url: url, isHistory: true });
+                  AR.processHistoryObj(o, sid);
+                  return o;
+                }
               }
               return raw;
             }

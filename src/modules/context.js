@@ -3,8 +3,10 @@
  *
  * 用量口径（2026-10-11 官网实测复核）：
  *  - GET /api/v0/chat/history_messages 的每条 chat_message 自带 accumulated_token_usage，
- *    它是【该消息生成时整段上下文的累计 token】。序列单调递增，取最后一条（也是最大值）
- *    即当前会话真实占用；脚本注入前就存在的旧对话也能精确算出，无需文本估算。
+ *    它是【该消息生成时整段上下文的累计 token】。沿当前分支（叶子取
+ *    chat_session.current_message_id，向上走 parent_id）取最大值即当前会话真实占用；
+ *    不取全局 max——regenerate 会产生分支，老分支叶子上的值可能比当前分支高。
+ *    脚本注入前就存在的旧对话也能精确算出，无需文本估算。
  *  - 实时对话 SSE 亦回报 accumulated_token_usage（同一口径），取最新值即可。
  *  - 文本估算（estimateTokens）仅在接口没有真值时兜底；一旦拿到真值就不再参与，
  *    避免把渲染文本（含思考过程/排版标记）算进去而虚高。
@@ -15,15 +17,55 @@
 var Context = {
   sid: '', live: 0, busy: false, warned: false,
   LIMIT: 1048576,            // 官网当前模型上下文 ≈ 1M
+  // 新会话首条消息的挂起用量：那时请求体 chat_session_id 为空、URL 还没切成
+  // 新会话、SSE 的 ready/update_session 也不带会话 id——sid 根本拿不到。
+  // 以前这段用量整段丢弃，新对话发完第一条面板一直显示 0；现在挂起，等
+  // loadSid 见到 sid 再落库
+  _pending: 0, _pendingAt: 0, _pendingNoUrl: false,
+  // sid 是从在途流（而非 URL）里拿到的：新对话首条消息期间 URL 仍是 /
+  _sidFromStream: false,
 
   loadSid: function (sid) {
-    if (!sid) return;
-    if (sid !== this.sid) { this.sid = sid; this.warned = false; }
-    this.live = DSE.config.session(sid).serverTokens || 0;
+    if (!sid) {
+      // 欢迎页/新对话：没有会话就清掉上一个会话的占用，别留着旧数字。
+      // 但 sid 是从在途流里拿到的时候不能清——新对话首条消息期间 URL 还是 /，
+      // 流里已经拿到新 sid 并落了库，这一清会把刚统计到的用量连显示一起抹掉
+      if (this.sid && !this._sidFromStream) { this.sid = ''; this.live = 0; this.warned = false; this.emit(); }
+      return;
+    }
+    if (sid !== this.sid) {
+      this.sid = sid; this.warned = false;
+      this.live = DSE.config.session(sid).serverTokens || 0;
+    }
+    if (!this._sidFromStream || sid === Utils.currentSid()) this._sidFromStream = false;   // URL 追上来了
+    this._applyPending(sid);
     this.emit();
   },
+  // 挂起的首条用量落库：30s 内有效，且只落到「还没有任何用量/历史数据的新会话」上
+  // ——不能简单要求「存储里没有该 sid」：新对话若预填了系统提示词，prompt 模块的
+  // adoptPending 会先把会话条目建出来（只有 assistantSystemPrompt），那样这份用量
+  // 就被永远挡死了。反过来，已有用量或历史说明是老会话，不能把这份记到它头上
+  _applyPending: function (sid) {
+    if (!(this._pending > 0)) return;
+    var v = this._pending, fresh = this._pendingNoUrl && Date.now() - this._pendingAt < 30000;
+    this._pending = 0; this._pendingNoUrl = false;
+    if (!fresh) return;
+    var s0 = DSE.config.sessions()[sid];
+    if (s0 && ((s0.serverTokens || 0) > 0 || (s0.hist || []).length > 0)) return;
+    if (v > this.live) {
+      this.live = v;
+      var s = DSE.config.session(sid);
+      s.serverTokens = v;
+      DSE.config.saveSessions();
+    }
+  },
   setServer: function (sid, v) {
-    if (!sid || !(v > 0)) return;
+    if (!(v > 0)) return;
+    if (!sid) {
+      if (!Utils.currentSid()) { this._pending = Math.max(this._pending || 0, v); this._pendingAt = Date.now(); this._pendingNoUrl = true; }
+      return;
+    }
+    if (sid !== Utils.currentSid()) this._sidFromStream = true;   // sid 来自流/请求体，URL 还没切
     this.loadSid(sid);
     if (v !== this.live) {
       this.live = v;
@@ -33,7 +75,7 @@ var Context = {
       this.emit();
     }
   },
-  // 从历史响应里取权威用量（每条消息 accumulated_token_usage 的最大值 = 当前真实占用）
+  // 从历史响应里取权威用量（当前分支叶子节点向上取最大值 = 当前真实占用）
   onHistory: function (payload) {
     try {
       var biz = payload.json && payload.json.data && payload.json.data.biz_data;
@@ -42,11 +84,25 @@ var Context = {
       var sid = (biz.chat_session && biz.chat_session.id) || this.sid;
       if (!sid) return;
       this.loadSid(sid);
-      var maxTok = 0, text = '';
-      msgs.forEach(function (m) {
-        if (typeof m.accumulated_token_usage === 'number') maxTok = Math.max(maxTok, m.accumulated_token_usage);
-        (m.fragments || []).forEach(function (f) { text += f.content || ''; });
-      });
+      var text = '';
+      msgs.forEach(function (m) { (m.fragments || []).forEach(function (f) { text += f.content || ''; }); });
+      // 按当前分支算，不按全局最大值：regenerate 会产生分支，老分支叶子上的
+      // accumulated_token_usage 可能比当前分支高，取全局 max 会虚高（官网自己
+      // 也是按分支读的）。叶子优先用 chat_session.current_message_id（官网口径），
+      // 缺失退数组最后一条，再取不到才退回全局 max
+      var byId = {}, last = null;
+      msgs.forEach(function (m) { if (m && m.message_id) byId[m.message_id] = m; last = m; });
+      var leafId = (biz.chat_session && biz.chat_session.current_message_id) || (last && last.message_id) || '';
+      var maxTok = 0, node = byId[leafId], guard = 0;
+      while (node && guard++ < 2000) {
+        if (typeof node.accumulated_token_usage === 'number') maxTok = Math.max(maxTok, node.accumulated_token_usage);
+        node = node.parent_id ? byId[node.parent_id] : null;
+      }
+      if (!(maxTok > 0)) {
+        msgs.forEach(function (m) {
+          if (typeof m.accumulated_token_usage === 'number') maxTok = Math.max(maxTok, m.accumulated_token_usage);
+        });
+      }
       var s = DSE.config.session(sid), changed = false;
       if (maxTok > 0) {
         if (maxTok !== (s.serverTokens || 0)) { s.serverTokens = maxTok; changed = true; }
@@ -123,11 +179,19 @@ var Context = {
 
   init: function () {
     var self = this;
+    // 拦截层在 document-start 就装好了，history/SSE 响应可能早于本模块 init 到达
+    // （事件发了没人听）——把 net 记住的最后一份补放一次，否则那一段用量整段丢失
+    if (DSE.net) {
+      if (DSE.net.lastHistory) this.onHistory(DSE.net.lastHistory);
+      if (DSE.net.lastTokens) this.setServer((DSE.net.lastTokens.ctx && DSE.net.lastTokens.ctx.sid) || Utils.currentSid(), DSE.net.lastTokens.used);
+    }
     DSE.on('sse:tokens', function (p) { self.setServer(p.ctx.sid || Utils.currentSid(), p.used); });
     DSE.on('history:loaded', function (p) {
       self.loadSid(p.ctx.sid || Utils.currentSid()); self.onHistory(p);
     });
-    setInterval(function () { var s = Utils.currentSid(); if (s && s !== self.sid) self.loadSid(s); }, 1000);
+    // 轮询改为一律调用：loadSid('') 会清掉上一个会话的占用（欢迎页不该显示
+    // 旧会话数字），顺带把挂起的首条用量在 sid 一出现时落库
+    setInterval(function () { self.loadSid(Utils.currentSid()); }, 1000);
     DSE.on('cfg:change', function (e) { if (e.path === 'ctxWarnPct') { self.warned = false; self.emit(); } });
   }
 };

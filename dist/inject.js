@@ -83,7 +83,7 @@ var Bridge = {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DSE = window.DSE = {
-  version: '8.8.9',
+  version: '8.9.0',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   bridge: Bridge,
   modules: {},
@@ -606,6 +606,10 @@ DSE.register('i18n', I18N);
 var Net = {
   _reqMutators: [],
   _patched: false,
+  // 最后一份命中数据：拦截层在 document-start 就装好，但 history/SSE 响应可能
+  // 早于 context 模块 init 到达（事件发了没人听）——这里各留一份，init 时补放
+  lastHistory: null,
+  lastTokens: null,
 
   isGenUrl: function (u) {
     return /\/api\/v0\/chat\/(completion|regenerate|edit_message|continue|resume_stream)/.test(u || '');
@@ -614,6 +618,49 @@ var Net = {
     return /\/api\/v0\/(chat\/history_messages|chat_session\/fetch_page)/.test(u || '');
   },
   addRequestMutator: function (fn) { this._reqMutators.push(fn); },
+
+  // fetch 兜底：站点部分链路（如 resume_stream）走 fetch 而非 XHR，以前只改写
+  // 请求体、响应整段漏掉——用量统计在这些链路上永远不激活。这里对命中 URL 的
+  // 响应做 clone 旁路解析：原响应照常返回给站点，clone 只读来发事件，互不干扰
+  _patchFetch: function () {
+    var self = this;
+    var origFetch = window.fetch;
+    if (!origFetch) return;
+    window.fetch = function (input, init) {
+      var url = '', isGen = false, isHist = false, ctx = null;
+      try {
+        url = typeof input === 'string' ? input : (input && input.url) || '';
+        isGen = self.isGenUrl(url); isHist = self.isHistoryUrl(url);
+        if (isGen || isHist) {
+          ctx = {
+            url: url, isGen: isGen, isHistory: isHist, sid: '',
+            sse: { reqMid: null, respMid: null, tokens: 0, finished: false, rawLast: 0, ev: '' }
+          };
+          if (init && typeof init.body === 'string' && init.body.charAt(0) === '{') {
+            try {
+              var obj = JSON.parse(init.body);
+              ctx.sid = obj.chat_session_id || '';
+              self._reqMutators.forEach(function (fn) { try { fn(obj, ctx); } catch (e) { console.error('[DSE reqMutator]', e); } });
+              init = Object.assign({}, init, { body: JSON.stringify(obj) });
+            } catch (e) {}
+          }
+          DSE.emit('net:send', ctx);
+        }
+      } catch (e) {}
+      var p = origFetch.call(this, input, init);
+      if (!ctx || !p || typeof p.then !== 'function') return p;
+      return p.then(function (resp) {
+        try {
+          if (resp && typeof resp.clone === 'function') {
+            var c = resp.clone();
+            if (isHist) c.text().then(function (txt) { self.handleHistory(txt, ctx); }, function () {});
+            else c.text().then(function (txt) { self.parseSSE(txt, ctx); }, function () {});
+          }
+        } catch (e) {}
+        return resp;
+      });
+    };
+  },
 
   init: function () {
     if (this._patched) return; this._patched = true;
@@ -654,28 +701,22 @@ var Net = {
       return origSend.call(this, body);
     };
 
-    // fetch 兜底（站点当前走 XHR；仅处理请求改写）
-    var origFetch = window.fetch;
-    if (origFetch) {
-      window.fetch = function (input, init) {
-        try {
-          var url = typeof input === 'string' ? input : (input && input.url) || '';
-          if (self.isGenUrl(url) && init && typeof init.body === 'string' && init.body.charAt(0) === '{') {
-            var obj = JSON.parse(init.body);
-            self._reqMutators.forEach(function (fn) { try { fn(obj, { url: url, isGen: true, isHistory: false, sid: obj.chat_session_id }); } catch (e) {} });
-            init = Object.assign({}, init, { body: JSON.stringify(obj) });
-          }
-        } catch (e) {}
-        return origFetch.call(this, input, init);
-      };
-    }
+    this._patchFetch();
   },
 
   // 由防撤回层对【最终 SSE 文本】增量解析事件（token/ready/finished）
   parseSSE: function (text, ctx) {
     var s = ctx.sse;
     try {
-      var tail = text.substring(s.rawLast), lines = tail.split('\n');
+      var tail = text.substring(s.rawLast);
+      // 只处理到最后一个完整行为止，末尾半行留给下一次读取（站点自己的解析器
+      // 也是 lastIndexOf('\n') 这么干）。以前一律 rawLast = text.length，分片
+      // 恰好从一行中间切开时那条事件被永久吞掉——accumulated_token_usage 偶尔
+      // 不更新、实时用量卡住，就是这里漏的
+      var cut = tail.lastIndexOf('\n');
+      if (cut < 0) return;
+      var lines = tail.substring(0, cut).split('\n');
+      s.rawLast += cut + 1;
       for (var li = 0; li < lines.length; li++) {
         var ln = lines[li];
         if (ln.indexOf('event:') === 0) s.ev = ln.slice(6).trim();
@@ -683,12 +724,19 @@ var Net = {
         var payload = ln.replace(/^data:\s*/, '');
         if (!payload || payload === '[DONE]') continue;
         var data; try { data = JSON.parse(payload); } catch (e) { continue; }
+        // 新会话首条消息：请求体 chat_session_id 为空、URL 还没切成新会话，
+        // 但流里会带会话 id——先补进 ctx，setServer 才落得了库
+        if (!ctx.sid && typeof data.chat_session_id === 'string' && data.chat_session_id) ctx.sid = data.chat_session_id;
         if (s.ev === 'ready' && data.request_message_id) {
           s.reqMid = data.request_message_id; s.respMid = data.response_message_id;
           DSE.emit('sse:ready', { ctx: ctx, data: data });
         }
         var used = this._pickTokens(data);
-        if (used != null) { s.tokens = used; DSE.emit('sse:tokens', { used: used, ctx: ctx }); }
+        if (used != null) {
+          s.tokens = used;
+          this.lastTokens = { used: used, ctx: ctx };
+          DSE.emit('sse:tokens', { used: used, ctx: ctx });
+        }
         var finished = (data.p === 'response/status' && data.v === 'FINISHED') ||
           (data.p === 'response' && data.o === 'BATCH' && Array.isArray(data.v) &&
             data.v.some(function (x) { return x.p === 'status' && x.v === 'FINISHED'; })) ||
@@ -696,7 +744,6 @@ var Net = {
         if (finished && !s.finished) { s.finished = true; DSE.emit('sse:finished', { ctx: ctx }); }
         DSE.emit('sse:data', { data: data, ctx: ctx, event: s.ev });
       }
-      s.rawLast = text.length;
     } catch (e) {}
   },
 
@@ -728,13 +775,21 @@ var Net = {
     return walk(node);
   },
 
-  // 历史响应：剥离注入块 + 发出 history:loaded，返回处理后的文本
+  // 历史响应：剥离注入块 + 发出 history:loaded，返回处理后的数据
+  // raw 可以是字符串（responseType=text，站点默认）也可以是已解析对象
+  // （responseType=json）——后者以前整段跳过，history:loaded 从不触发，
+  // 面板用量永远停在 0
   handleHistory: function (raw, ctx) {
-    var parsed = null;
-    try { parsed = JSON.parse(raw); } catch (e) { return raw; }
+    var parsed = null, wasString = typeof raw === 'string';
+    if (wasString) {
+      try { parsed = JSON.parse(raw); } catch (e) { return raw; }
+    } else if (raw && typeof raw === 'object') {
+      parsed = raw;
+    } else return raw;
     parsed = this._stripInjected(parsed);
+    this.lastHistory = { json: parsed, ctx: ctx };
     DSE.emit('history:loaded', { json: parsed, ctx: ctx });
-    return JSON.stringify(parsed);
+    return wasString ? JSON.stringify(parsed) : parsed;
   }
 };
 DSE.net = Net;
@@ -1313,14 +1368,22 @@ var AntiRecall = {
   },
 
   // 历史回放：status=CONTENT_FILTER 的消息用本地缓存替换（照搬 v7.2）+ 智能对账
+  // 字符串入口：站点默认 responseType=text，读的是 responseText。没改过就原样
+  // 返回原文（不重新序列化，避免无谓的字节级差异）
   processHistoryJSON: function (rawText, sid) {
+    var json;
+    try { json = JSON.parse(rawText); } catch (e) { return rawText; }
+    return this.processHistoryObj(json, sid) ? JSON.stringify(json) : rawText;
+  },
+  // 对象入口：站点若用 responseType=json，读的是 response（对象）——以前这里
+  // 整段 return，撤回内容不替换、history:loaded 也不发。原地改写，返回是否改过
+  processHistoryObj: function (json, sid) {
     var AR = this;
     try {
-      var json = JSON.parse(rawText);
-      if (!json.data || !json.data.biz_data) return rawText;
+      if (!json.data || !json.data.biz_data) return false;
       var data = json.data.biz_data;
       var sessId = (data.chat_session && data.chat_session.id) || sid || '';
-      if (!data.chat_messages) return rawText;
+      if (!data.chat_messages) return false;
       var modified = false;
       var serverTexts = {};
       for (var i = 0; i < data.chat_messages.length; i++) {
@@ -1339,9 +1402,10 @@ var AntiRecall = {
           h.serverHas = true; modified = true;
         }
       });
-      if (modified) { DSE.config.saveSessions(); json.data.biz_data = data; return JSON.stringify(json); }
+      if (modified) DSE.config.saveSessions();
+      return modified;
     } catch (e) {}
-    return rawText;
+    return false;
   },
 
   /* ================= XHR 挂载层（照搬 v7.2 结构，链式包在 net 之外） ================= */
@@ -1402,11 +1466,23 @@ var AntiRecall = {
             configurable: true, enumerable: true,
             get: function () {
               var raw = _origRespGetter.call(xhr);
-              if (typeof raw !== 'string') return raw;
-              if (isGen && state) return AR.processSSEStream(String(raw), state).text;
+              if (isGen && state) {
+                if (typeof raw !== 'string') return raw;
+                return AR.processSSEStream(String(raw), state).text;
+              }
               if (isHist) {
-                var t = DSE.net.handleHistory(raw, xhr._dseCtx || { url: url, isHistory: true });
-                return AR.processHistoryJSON(t, sid);
+                if (typeof raw === 'string') {
+                  var t = DSE.net.handleHistory(raw, xhr._dseCtx || { url: url, isHistory: true });
+                  return AR.processHistoryJSON(t, sid);
+                }
+                // responseType='json'：站点读的是对象。以前 typeof raw !== 'string'
+                // 就整段放行，撤回不替换、history:loaded 不发——用量统计在这种
+                // 站点行为下永远显示 0
+                if (raw && typeof raw === 'object') {
+                  var o = DSE.net.handleHistory(raw, xhr._dseCtx || { url: url, isHistory: true });
+                  AR.processHistoryObj(o, sid);
+                  return o;
+                }
               }
               return raw;
             }
@@ -1905,8 +1981,10 @@ DSE.modules.tweaks = Tweaks;
  *
  * 用量口径（2026-10-11 官网实测复核）：
  *  - GET /api/v0/chat/history_messages 的每条 chat_message 自带 accumulated_token_usage，
- *    它是【该消息生成时整段上下文的累计 token】。序列单调递增，取最后一条（也是最大值）
- *    即当前会话真实占用；脚本注入前就存在的旧对话也能精确算出，无需文本估算。
+ *    它是【该消息生成时整段上下文的累计 token】。沿当前分支（叶子取
+ *    chat_session.current_message_id，向上走 parent_id）取最大值即当前会话真实占用；
+ *    不取全局 max——regenerate 会产生分支，老分支叶子上的值可能比当前分支高。
+ *    脚本注入前就存在的旧对话也能精确算出，无需文本估算。
  *  - 实时对话 SSE 亦回报 accumulated_token_usage（同一口径），取最新值即可。
  *  - 文本估算（estimateTokens）仅在接口没有真值时兜底；一旦拿到真值就不再参与，
  *    避免把渲染文本（含思考过程/排版标记）算进去而虚高。
@@ -1917,15 +1995,55 @@ DSE.modules.tweaks = Tweaks;
 var Context = {
   sid: '', live: 0, busy: false, warned: false,
   LIMIT: 1048576,            // 官网当前模型上下文 ≈ 1M
+  // 新会话首条消息的挂起用量：那时请求体 chat_session_id 为空、URL 还没切成
+  // 新会话、SSE 的 ready/update_session 也不带会话 id——sid 根本拿不到。
+  // 以前这段用量整段丢弃，新对话发完第一条面板一直显示 0；现在挂起，等
+  // loadSid 见到 sid 再落库
+  _pending: 0, _pendingAt: 0, _pendingNoUrl: false,
+  // sid 是从在途流（而非 URL）里拿到的：新对话首条消息期间 URL 仍是 /
+  _sidFromStream: false,
 
   loadSid: function (sid) {
-    if (!sid) return;
-    if (sid !== this.sid) { this.sid = sid; this.warned = false; }
-    this.live = DSE.config.session(sid).serverTokens || 0;
+    if (!sid) {
+      // 欢迎页/新对话：没有会话就清掉上一个会话的占用，别留着旧数字。
+      // 但 sid 是从在途流里拿到的时候不能清——新对话首条消息期间 URL 还是 /，
+      // 流里已经拿到新 sid 并落了库，这一清会把刚统计到的用量连显示一起抹掉
+      if (this.sid && !this._sidFromStream) { this.sid = ''; this.live = 0; this.warned = false; this.emit(); }
+      return;
+    }
+    if (sid !== this.sid) {
+      this.sid = sid; this.warned = false;
+      this.live = DSE.config.session(sid).serverTokens || 0;
+    }
+    if (!this._sidFromStream || sid === Utils.currentSid()) this._sidFromStream = false;   // URL 追上来了
+    this._applyPending(sid);
     this.emit();
   },
+  // 挂起的首条用量落库：30s 内有效，且只落到「还没有任何用量/历史数据的新会话」上
+  // ——不能简单要求「存储里没有该 sid」：新对话若预填了系统提示词，prompt 模块的
+  // adoptPending 会先把会话条目建出来（只有 assistantSystemPrompt），那样这份用量
+  // 就被永远挡死了。反过来，已有用量或历史说明是老会话，不能把这份记到它头上
+  _applyPending: function (sid) {
+    if (!(this._pending > 0)) return;
+    var v = this._pending, fresh = this._pendingNoUrl && Date.now() - this._pendingAt < 30000;
+    this._pending = 0; this._pendingNoUrl = false;
+    if (!fresh) return;
+    var s0 = DSE.config.sessions()[sid];
+    if (s0 && ((s0.serverTokens || 0) > 0 || (s0.hist || []).length > 0)) return;
+    if (v > this.live) {
+      this.live = v;
+      var s = DSE.config.session(sid);
+      s.serverTokens = v;
+      DSE.config.saveSessions();
+    }
+  },
   setServer: function (sid, v) {
-    if (!sid || !(v > 0)) return;
+    if (!(v > 0)) return;
+    if (!sid) {
+      if (!Utils.currentSid()) { this._pending = Math.max(this._pending || 0, v); this._pendingAt = Date.now(); this._pendingNoUrl = true; }
+      return;
+    }
+    if (sid !== Utils.currentSid()) this._sidFromStream = true;   // sid 来自流/请求体，URL 还没切
     this.loadSid(sid);
     if (v !== this.live) {
       this.live = v;
@@ -1935,7 +2053,7 @@ var Context = {
       this.emit();
     }
   },
-  // 从历史响应里取权威用量（每条消息 accumulated_token_usage 的最大值 = 当前真实占用）
+  // 从历史响应里取权威用量（当前分支叶子节点向上取最大值 = 当前真实占用）
   onHistory: function (payload) {
     try {
       var biz = payload.json && payload.json.data && payload.json.data.biz_data;
@@ -1944,11 +2062,25 @@ var Context = {
       var sid = (biz.chat_session && biz.chat_session.id) || this.sid;
       if (!sid) return;
       this.loadSid(sid);
-      var maxTok = 0, text = '';
-      msgs.forEach(function (m) {
-        if (typeof m.accumulated_token_usage === 'number') maxTok = Math.max(maxTok, m.accumulated_token_usage);
-        (m.fragments || []).forEach(function (f) { text += f.content || ''; });
-      });
+      var text = '';
+      msgs.forEach(function (m) { (m.fragments || []).forEach(function (f) { text += f.content || ''; }); });
+      // 按当前分支算，不按全局最大值：regenerate 会产生分支，老分支叶子上的
+      // accumulated_token_usage 可能比当前分支高，取全局 max 会虚高（官网自己
+      // 也是按分支读的）。叶子优先用 chat_session.current_message_id（官网口径），
+      // 缺失退数组最后一条，再取不到才退回全局 max
+      var byId = {}, last = null;
+      msgs.forEach(function (m) { if (m && m.message_id) byId[m.message_id] = m; last = m; });
+      var leafId = (biz.chat_session && biz.chat_session.current_message_id) || (last && last.message_id) || '';
+      var maxTok = 0, node = byId[leafId], guard = 0;
+      while (node && guard++ < 2000) {
+        if (typeof node.accumulated_token_usage === 'number') maxTok = Math.max(maxTok, node.accumulated_token_usage);
+        node = node.parent_id ? byId[node.parent_id] : null;
+      }
+      if (!(maxTok > 0)) {
+        msgs.forEach(function (m) {
+          if (typeof m.accumulated_token_usage === 'number') maxTok = Math.max(maxTok, m.accumulated_token_usage);
+        });
+      }
       var s = DSE.config.session(sid), changed = false;
       if (maxTok > 0) {
         if (maxTok !== (s.serverTokens || 0)) { s.serverTokens = maxTok; changed = true; }
@@ -2025,11 +2157,19 @@ var Context = {
 
   init: function () {
     var self = this;
+    // 拦截层在 document-start 就装好了，history/SSE 响应可能早于本模块 init 到达
+    // （事件发了没人听）——把 net 记住的最后一份补放一次，否则那一段用量整段丢失
+    if (DSE.net) {
+      if (DSE.net.lastHistory) this.onHistory(DSE.net.lastHistory);
+      if (DSE.net.lastTokens) this.setServer((DSE.net.lastTokens.ctx && DSE.net.lastTokens.ctx.sid) || Utils.currentSid(), DSE.net.lastTokens.used);
+    }
     DSE.on('sse:tokens', function (p) { self.setServer(p.ctx.sid || Utils.currentSid(), p.used); });
     DSE.on('history:loaded', function (p) {
       self.loadSid(p.ctx.sid || Utils.currentSid()); self.onHistory(p);
     });
-    setInterval(function () { var s = Utils.currentSid(); if (s && s !== self.sid) self.loadSid(s); }, 1000);
+    // 轮询改为一律调用：loadSid('') 会清掉上一个会话的占用（欢迎页不该显示
+    // 旧会话数字），顺带把挂起的首条用量在 sid 一出现时落库
+    setInterval(function () { self.loadSid(Utils.currentSid()); }, 1000);
     DSE.on('cfg:change', function (e) { if (e.path === 'ctxWarnPct') { self.warned = false; self.emit(); } });
   }
 };
@@ -2654,11 +2794,13 @@ var DemoApi = {
     var ctrlCss = pick(refCtrl, ['backgroundColor', 'color']);
     // 注意 box-sizing：demo 的全局 reset 不覆盖注入节点，默认 content-box 会
     // 让 60px 的行变成 84px（padding 外加）——与官方行观感不一致
-    var rowBase = 'display:flex;align-items:center;gap:8px;box-sizing:border-box;min-height:60px;padding:12px 0;font-size:14px';
-    var ctrlStyle = 'box-sizing:border-box;width:240px;height:36px;border:none;outline:none;border-radius:18px;padding:0 14px;' +
+    // 紧凑规格：行高从 60px 收到 44px、控件 36→32px、说明行 12→11px。
+    // 这一屏有 6 行 + 2 条说明，按原规格设置面板要滚好长才能看到「高级选项」
+    var rowBase = 'display:flex;align-items:center;gap:8px;box-sizing:border-box;min-height:44px;padding:6px 0;font-size:14px';
+    var ctrlStyle = 'box-sizing:border-box;width:240px;height:32px;border:none;outline:none;border-radius:16px;padding:0 14px;' +
       'font-size:14px;background:' + (ctrlCss.backgroundColor || 'rgba(127,127,127,.18)') + ';' +
       'color:' + (ctrlCss.color || 'inherit');
-    var descStyle = 'box-sizing:border-box;font-size:12px;line-height:1.5;opacity:.55;padding:0 0 6px';
+    var descStyle = 'box-sizing:border-box;font-size:11px;line-height:1.4;opacity:.55;padding:0 0 3px';
 
     var self = this;
     var mkRow = function (labelText, cfgKey, placeholder, title, isPassword, hints, listId) {
@@ -2676,14 +2818,17 @@ var DemoApi = {
       input.value = self.cfg(cfgKey);
       input.title = title;
       input.style.cssText = ctrlStyle;
+      // 即改即存（输入 300ms 防抖、失焦立即）。commit 挂到 input._dseCommit 上，
+      // 底部「保存」按钮靠它冲掉还没落盘的防抖值
+      var commit = function () { DSE.config.set(self.KEYS[cfgKey], input.value.trim()); };
+      input._dseCommit = commit;
       input.addEventListener('input', function () {
         clearTimeout(input._dseT);
-        var v = input.value.trim();
-        input._dseT = setTimeout(function () { DSE.config.set(self.KEYS[cfgKey], v); }, 300);
+        input._dseT = setTimeout(function () { input._dseT = null; commit(); }, 300);
       });
       input.addEventListener('blur', function () {
-        clearTimeout(input._dseT);
-        DSE.config.set(self.KEYS[cfgKey], input.value.trim());
+        clearTimeout(input._dseT); input._dseT = null;
+        commit();
       });
       row.appendChild(label);
       row.appendChild(input);
@@ -2796,6 +2941,40 @@ var DemoApi = {
     cfgBox.appendChild(withDesc(mkRow('API Key', 'key', DSE.t('（用页面里填的官方 Key）'), KEY_DESC, true), KEY_DESC));
     cfgBox.appendChild(mkRow('模型', 'model', DSE.t('deepseek-flash（官方默认）'),
       DSE.t('留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段'), false, DemoApi.HINTS, 'dse-model-hints'));
+
+    /* ---------- 保存按钮（放在主字段下方、测试行之前：一眼可见，不用滚动） ----------
+     * 这些项本来就是即改即存（输入 300ms 防抖、下拉 change 即时、失焦立即），
+     * 但用户看不出来，也不确定直接关掉设置会不会丢——于是给一个显式「保存」：
+     * 点一下冲掉所有未落盘的防抖写入、立即写盘并反馈；左边一句「改动会自动保存」
+     * 把真实行为说明白，关不关面板都不会丢 */
+    var saveRow = document.createElement('div');
+    saveRow.setAttribute('data-dse-api-row', 'save');
+    saveRow.style.cssText = rowBase + 'margin-top:2px';
+    var saveHint = document.createElement('div');
+    saveHint.textContent = DSE.t('改动会自动保存，关掉面板也不会丢；点此可立即保存并确认');
+    saveHint.style.cssText = 'flex:1;font-size:11px;line-height:1.4;opacity:.6;padding-right:8px';
+    var saveBtn = document.createElement('button');
+    saveBtn.type = 'button';
+    saveBtn.textContent = DSE.t('保存');
+    var saveAccent = getComputedStyle(document.documentElement).getPropertyValue('--dse-accent').trim() || '#3b6cf6';
+    saveBtn.style.cssText = 'box-sizing:border-box;height:32px;border:none;outline:none;cursor:pointer;' +
+      'border-radius:16px;padding:0 20px;font-size:13px;background:' + saveAccent + ';color:#fff;flex:0 0 auto';
+    var saveBtnTimer = null;
+    saveBtn.addEventListener('click', function () {
+      // 冲掉未落盘的防抖写入（刚打完字还没到 300ms 的情况）
+      cfgBox.querySelectorAll('input').forEach(function (inp) {
+        if (inp._dseT) { clearTimeout(inp._dseT); inp._dseT = null; }
+        if (typeof inp._dseCommit === 'function') inp._dseCommit();
+      });
+      DSE.config.save();
+      Utils.toast(DSE.t('已保存'), 1500);
+      saveBtn.textContent = DSE.t('已保存 ✓');
+      clearTimeout(saveBtnTimer);
+      saveBtnTimer = setTimeout(function () { saveBtn.textContent = DSE.t('保存'); }, 1600);
+    });
+    saveRow.appendChild(saveHint);
+    saveRow.appendChild(saveBtn);
+    cfgBox.appendChild(saveRow);
     // 模型测试：一发极小请求验证端点/Key/模型是否可用，并让模型自述身份——
     // DeepSeek 会答"我是DeepSeek"，第三方模型会答出自己的真实身份，用户据此
     // 确认切换真的生效了
@@ -2809,11 +2988,11 @@ var DemoApi = {
     testBtn.type = 'button';
     testBtn.textContent = DSE.t('测试');
     var accent = getComputedStyle(document.documentElement).getPropertyValue('--dse-accent').trim() || '#3b6cf6';
-    testBtn.style.cssText = 'box-sizing:border-box;height:36px;border:none;outline:none;cursor:pointer;' +
-      'border-radius:18px;padding:0 20px;font-size:14px;background:' + accent + ';color:#fff;flex:0 0 auto';
+    testBtn.style.cssText = 'box-sizing:border-box;height:32px;border:none;outline:none;cursor:pointer;' +
+      'border-radius:16px;padding:0 18px;font-size:13px;background:' + accent + ';color:#fff;flex:0 0 auto';
     var testResult = document.createElement('div');
     testResult.setAttribute('data-dse-test-result', '1');
-    testResult.style.cssText = 'display:none;box-sizing:border-box;font-size:12px;line-height:1.6;padding:2px 0 8px;white-space:pre-wrap;word-break:break-all';
+    testResult.style.cssText = 'display:none;box-sizing:border-box;font-size:11px;line-height:1.5;padding:1px 0 6px;white-space:pre-wrap;word-break:break-all';
     testBtn.addEventListener('click', function () {
       testResult.style.display = 'block';
       testResult.style.color = 'inherit';
@@ -2897,8 +3076,8 @@ var DemoApi = {
     advBox.appendChild(withDesc(mkSelect('起名来源', 'titleSource',
       [['deepseek', 'deepseek：官方起名腿'], ['model', 'model：自定义模型起名'], ['off', 'off：用首条消息截断']], 'deepseek', TITLE_SOURCE_TITLE), TITLE_SOURCE_DESC));
     advBox.appendChild(withDesc(mkRow('上下文窗口', 'ctxLimit', '128000',
-      DSE.t('所用模型的上下文窗口（tokens）。输入框旁的圆圈按 占用/窗口 显示百分比'), false, null, null),
-      DSE.t('所用模型的上下文窗口（tokens）。输入框旁的圆圈按 占用/窗口 显示百分比')));
+      DSE.t('所用模型的上下文窗口（tokens）。可填 128000，也可写 128k / 1m。输入框旁的圆圈按 占用/窗口 显示百分比'), false, null, null),
+      DSE.t('所用模型的上下文窗口（tokens）。可填 128000，也可写 128k / 1m。输入框旁的圆圈按 占用/窗口 显示百分比')));
     advBox.appendChild(withDesc(mkSelect('Key 请求头', 'keyHeader',
       [['x-api-key', 'x-api-key（默认）'], ['authorization', 'authorization（Bearer）']], 'x-api-key'),
       '个别网站（如 StepFun）的浏览器安全策略只认 Authorization 请求头，连不上时改选 authorization'));
@@ -4036,7 +4215,16 @@ var DemoBridge = {
     }).then(function (resp) {
       if (!resp.ok) return resp.text().then(function (t) { throw new Error('leg http ' + resp.status + ': ' + t.slice(0, 200)); });
       var out = { blocks: [], text: '', usage: null };
+      // 同主流程：input 类 usage 可能只在 message_start 给
+      var mergeLegUsage = function (u) {
+        if (!u) return;
+        out.usage = out.usage || {};
+        ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'].forEach(function (k) {
+          if (typeof u[k] === 'number' && (out.usage[k] == null || u[k] > 0)) out.usage[k] = u[k];
+        });
+      };
       return self.pump(resp.body, function (j) {
+        if (j.type === 'message_start' && j.message) mergeLegUsage(j.message.usage);
         if (j.type === 'content_block_start') {
           var cb = j.content_block || {};
           var b = { index: nextIdx(), raw: cb, fwd: false };
@@ -4059,7 +4247,7 @@ var DemoBridge = {
           var b2 = out.blocks[out.blocks.length - 1];
           if (b2 && b2.fwd) push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: b2.index }));
         } else if (j.type === 'message_delta') {
-          out.usage = j.usage || out.usage;
+          mergeLegUsage(j.usage);
         }
       }, ac.signal).then(function () { clearTimeout(timer); return out; });
     }).catch(function (e) {
@@ -4155,8 +4343,20 @@ var DemoBridge = {
           var blocks = [];       // 本轮完整块（供下一轮历史）
           var partial = {};      // index → 累积 input_json
           var roundUsage = null, roundStop = 'end_turn', respModel = '';
+          // usage 合并：Anthropic 系把 input 类放在 message_start.message.usage、
+          // output 放在 message_delta.usage，很多第三方端点只给其中一个——
+          // 以前只读 message_delta，遇到「只在 message_start 给 input_tokens」
+          // 的端点就算出 used=0，圆圈永远显示 0%。这里按字段合并，0 不覆盖已有值
+          var mergeUsage = function (u) {
+            if (!u) return;
+            roundUsage = roundUsage || {};
+            ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'].forEach(function (k) {
+              if (typeof u[k] === 'number' && (roundUsage[k] == null || u[k] > 0)) roundUsage[k] = u[k];
+            });
+          };
           await self.pump(resp.body, function (j) {
             if (j.type === 'message_start' && j.message && j.message.model) respModel = j.message.model;
+            if (j.type === 'message_start' && j.message) mergeUsage(j.message.usage);
             if (j.type === 'content_block_start') {
               var cb = j.content_block || {};
               var b = { type: cb.type, raw: cb, index: nextIdx() };
@@ -4182,7 +4382,7 @@ var DemoBridge = {
                 push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: b2.index }));
               }
             } else if (j.type === 'message_delta') {
-              roundUsage = j.usage || roundUsage;
+              mergeUsage(j.usage);
               if (j.delta && j.delta.stop_reason) roundStop = j.delta.stop_reason;
             }
           }, ac.signal);
@@ -4277,15 +4477,32 @@ DSE.modules.demoBridge = DemoBridge;
  * （input + cache_read + cache_creation = 本次请求模型实际收到的全部
  * 内容：系统提示/工具定义/完整历史——非文本估算），经 'ctx:api' 事件
  * 广播。本模块只负责把占用/窗口画成一个环，注入在输入工具条里、
- * 发送按钮一侧。常驻显示：开着自定义模型就在（首次对话前显示 0%），
- * 交换后变精确值；关闭总开关才隐藏。
+ * 发送按钮一侧。常驻显示：配了第三方端点（桥接活动）就在（首次对话前显示
+ * 0%），总开关关、或端点是官方/未配（桥接不跑、永远没有数据）时隐藏。
  * ============================================================ */
 var CtxRing = {
   SIZE: 22, R: 8.5,
 
+  // 解析「上下文窗口」输入：支持 128000 / 128k / 1m / 1M 等写法（大小写不敏感，
+  // 容忍逗号空格和 tokens 后缀）。以前直接 parseInt——用户按习惯打 "1m" 会被解析
+  // 成 1，窗口变成 1 token，圆圈瞬间 100% 变红、浮层显示 "35K/1（100.0%）"，
+  // 而用户只是想扩展到 1M（2026-11-18 实测复现）。解析不出来返回 0，由 limit() 回退
+  parseLimit: function (raw) {
+    if (typeof raw === 'number') return (isFinite(raw) && raw > 0) ? Math.floor(raw) : 0;
+    var s = String(raw == null ? '' : raw).trim().toLowerCase()
+      .replace(/[,\s_]/g, '').replace(/tokens?$/, '');
+    if (!s) return 0;
+    var m = s.match(/^(\d+(?:\.\d+)?)(k|m)?$/);
+    if (!m) return 0;
+    var n = parseFloat(m[1]);
+    if (m[2] === 'k') n *= 1e3;
+    else if (m[2] === 'm') n *= 1e6;
+    return (isFinite(n) && n > 0) ? Math.floor(n) : 0;
+  },
+
   limit: function () {
-    var v = parseInt(DSE.config.get('demoCtxLimit'), 10);
-    return (v > 0) ? v : 128000;
+    var v = this.parseLimit(DSE.config.get('demoCtxLimit'));
+    return v > 0 ? v : 128000;
   },
 
   fmt: function (n) {
@@ -4326,6 +4543,18 @@ var CtxRing = {
     return btn;
   },
 
+  // 圆圈能不能显示：总开关开着【且桥接真的在跑】。桥接只在配了第三方
+  // （非 deepseek.com）端点时才活动——开着自定义模型但用的是官方端点时，
+  // 请求原生透传、ctx:api 永远不来，圆圈就是个永远 0% 的装饰。
+  // 实测（2026-11-18 官网 demo 页）：官方端点下 message_start/message_delta
+  // 的 usage 都是全的，但桥接不跑所以一个字都拿不到——这种「看得见却永远
+  // 是 0」比不显示更糟，故与设置面板同一思路：不适用就隐藏
+  canShow: function () {
+    if (!DSE.config.get('demoCustom')) return false;
+    var B = DSE.modules.demoBridge;
+    return !!(B && typeof B.active === 'function' && B.active());
+  },
+
   update: function (data) {
     var self = this;   // 必须在方法内捕获——裸 self 会解析到浏览器全局 window.self
     // 注意 used===0 的判定：早先用 `data.used ? data.used : data`，0 是 falsy
@@ -4343,7 +4572,7 @@ var CtxRing = {
     if (arc) arc.setAttribute('stroke-dashoffset', (C * (1 - pct / 100)).toFixed(2));
     // 颜色分级：>90% 危险 / >70% 警告（与设置面板的 ctx 分级一致）
     arc.setAttribute('stroke', pct >= 90 ? '#f87171' : (pct >= 70 ? '#fbbf24' : 'var(--dse-accent)'));
-    btn.style.display = DSE.config.get('demoCustom') ? 'inline-flex' : 'none';
+    btn.style.display = this.canShow() ? 'inline-flex' : 'none';
     // 富信息悬浮面板替代原生 title
     btn.onmouseenter = function () { self.showPanel(); };
     btn.onmouseleave = function () { self.hidePanel(); };
@@ -4491,18 +4720,23 @@ var CtxRing = {
       self.update(self._data || self.emptyData());
       bindPrecise();
       DSE.on('ctx:api', function (p) { if (p && p.used > 0) self.update(p); });
-      // 常驻显隐由总开关决定：关→隐藏；开→立刻显示（没数据时 0%），不必等
-      // 首次对话——用户要求圆圈一直显示
+      // 常驻显隐由「总开关 + 桥接是否活动」共同决定：关→隐藏；开且桥接在跑
+      // （配了第三方端点）→立刻显示（没数据时 0%），不必等首次对话；
+      // demoCustom 开着但端点是官方/未配时桥接不跑，圆圈永远拿不到数据，
+      // 那种情况下隐藏（见 canShow 注释）
       DSE.on('cfg:change', function (e) {
-        if (e.path === 'demoCustom') {
-          if (e.value) self.update(self._data || self.emptyData());
-          else {
-            var b = document.getElementById('dse-ctx-ring');
-            if (b) b.style.display = 'none';
-            self.hidePanel();
-          }
+        if (e.path === 'demoCustom' || e.path === 'demoEndpoint' || e.path === 'demoBridge') {
+          self.update(self._data || self.emptyData());
+          if (!self.canShow()) self.hidePanel();
         }
-        if (e.path === 'demoCtxLimit' && self._data) { self.update(self._data); self.hidePanel(); }
+        if (e.path === 'demoCtxLimit') {
+          // 输入改不动的（比如把 128k 打成 128x）要给个反馈，否则用户只会看到
+          // 百分比毫无变化、以为脚本坏了
+          if (String(DSE.config.get('demoCtxLimit') || '').trim() && !self.parseLimit(DSE.config.get('demoCtxLimit'))) {
+            Utils.toast(DSE.t('上下文窗口无法识别「{v}」，已按 128K 计算。可填 128000 / 128k / 1m', { v: String(DSE.config.get('demoCtxLimit')).slice(0, 20) }), 3600);
+          }
+          if (self._data) { self.update(self._data); self.hidePanel(); }
+        }
       });
       // 工具条会随会话切换重建——保持圆圈在场。节流（带前缘）而非防抖：
       // 防抖会被连续 DOM 变动不断重置，重建后圆圈迟迟不出现
@@ -4901,6 +5135,11 @@ DSE.modules.panel = Panel;
 /* ===== main.js ===== */
 /* ============================================================
  * main：初始化（顺序敏感：网络层 → 防撤回 → 提示词 → 其余）
+ *
+ * 网络层（net / antiRecall）必须在 document-start 就装好，不能等 DOMContentLoaded：
+ * 站点完全可能在 DCL 之前就发出首屏请求（内联预取、早期 XHR），晚一步打 patch
+ * 那段响应就整段漏掉——表现为「用量统计有时候不激活、一直显示 0」。
+ * 这两个模块只碰原型和事件总线，不依赖 DOM，提前装没有副作用。
  * ============================================================ */
 (function () {
   var order = [
@@ -4925,14 +5164,22 @@ DSE.modules.panel = Panel;
     'tabTitle',
     'panel'
   ];
+  // 提前装的模块：其余仍等 DCL（要 DOM）
+  var EARLY = ['net', 'antiRecall'];
+
+  function initModule(name) {
+    var m = DSE.modules[name];
+    if (!m || typeof m.init !== 'function') return;
+    if (m._inited) return;              // 提前装过就不再装（请求改写器会重复注册）
+    m._inited = true;
+    try { m.init(); } catch (e) { console.error('[DSE] init fail:', name, e); }
+  }
+
+  EARLY.forEach(initModule);
+
   function boot() {
     try {
-      order.forEach(function (name) {
-        var m = DSE.modules[name];
-        if (m && typeof m.init === 'function') {
-          try { m.init(); } catch (e) { console.error('[DSE] init fail:', name, e); }
-        }
-      });
+      order.forEach(initModule);
       DSE.emit('dse:ready');
       console.log('%c[DeepSeek Enhance] v' + DSE.version + ' loaded', 'color:#3b6cf6');
     } catch (e) { console.error('[DSE] boot error', e); }
