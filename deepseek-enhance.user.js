@@ -2,7 +2,7 @@
 // @name         DeepSeek Enhance 深度增强
 // @name:en      DeepSeek Enhance
 // @namespace    https://github.com/Hiweny/deepseek-enhance
-// @version      8.8.4
+// @version      8.8.5
 // @description  气泡材质(默认iOS磨砂)/思考自动折叠/代码块自动折叠/中英文界面/Markdown本地美化/LaTeX/图片URL背景/顶栏背景透出/按会话隔离的系统提示词(新对话可先填后发)/防撤回/上下文用量/消息导航(虚拟列表适配)/输入框磨砂/移动端适配
 // @updateURL    https://raw.githubusercontent.com/dongyu23/deepseek-enhance/main/deepseek-enhance.meta.js
 // @downloadURL  https://raw.githubusercontent.com/dongyu23/deepseek-enhance/main/deepseek-enhance.user.js
@@ -106,7 +106,7 @@ var Bridge = {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DSE = window.DSE = {
-  version: '8.8.4',
+  version: '8.8.5',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   bridge: Bridge,
   modules: {},
@@ -3454,17 +3454,21 @@ var DemoBridge = {
       var p = reminder.split(',');
       system += '\n\n当前时间：' + (p[0] || '') + ' ' + (p[1] || '') + '；语言：' + (p[4] || '中文') + '；平台：' + (p[3] || 'Web') + '。';
     }
+    // 工具规程：两个工具是**配合**使用的，必须把分工写明白。此前只点名两个
+    // 工具名、不说怎么配合，模型会在思维链里把 read_url 当成"文本提到但函数
+    // 列表里没有"的东西、从而整轮不调用它（2026-11-18 用户实测反馈）——工具
+    // 本身两种模式都声明了，缺的是这段指引
     system += '\n\n你可以使用 web_search / read_url 工具获取实时信息，结果会以 tool_result 返回。' +
-      '需要最新或外部信息时必须调用工具，不要凭空回答。同一轮回答中 web_search 不超过 2 次，尽量一次搜准。' +
-      '调用工具前不要输出面向用户的文本。';
-    var searchApiMode = (DSE.config.get('demoToolMode') || 'native') === 'searchapi';
+      '需要最新或外部信息时必须调用工具，不要凭空回答。两个工具配合使用：先用 web_search 找到相关网页，' +
+      '需要核实细节（日期、数字、原文表述）时再用 read_url 读取其中网页全文。' +
+      '同一轮回答中 web_search 不超过 2 次，尽量一次搜准。调用工具前不要输出面向用户的文本。';
     var tools = [
-      { name: 'web_search', description: '搜索网页获取实时信息。需要最新/外部信息时必须调用。',
+      { name: 'web_search', description: '搜索网页获取实时信息，返回标题/链接/摘要列表。需要最新或外部信息时先用本工具。',
         input_schema: { type: 'object', properties: { query: { type: 'string', description: '搜索查询词' } }, required: ['query'] } }
     ];
     // read_url 两种模式都声明：native 走模型对话内的读网页工具；searchapi
     // 直调独立 Fetch API（/v1/tools/fetch）
-    tools.push({ name: 'read_url', description: '读取指定网页全文。需要某网页详细内容时调用。',
+    tools.push({ name: 'read_url', description: '读取指定网页的全文内容。搜索结果里需要核实细节（日期、数字、原文表述）时，用本工具打开对应链接。',
       input_schema: { type: 'object', properties: { url: { type: 'string', description: '网页 URL' } }, required: ['url'] } });
     var out = {
       model: (DSE.config.get('demoModel') || '').trim() || body.model,
