@@ -62,15 +62,23 @@ var DemoBridge = {
     return (DSE.modules.demoApi && DSE.modules.demoApi._origFetch) || window.fetch;
   },
 
+  // 出站头：只发最小必要集，绝不照抄页面原始头。
+  // 2026-11-18 实测（StepFun）：页面请求自带 anthropic-version、x-ds-trace-id
+  // 和一个小写 content-type，桥接原先连它们一起转发——而这些头不在 StepFun 的
+  // CORS allow-headers 里，浏览器预检直接失败、只报 TypeError: Failed to fetch，
+  // 用户完全看不出是哪个头被拒。只发 Content-Type / Accept / Authorization
+  // 三个头，同一条请求立刻 200。
+  // Key 一律放 Authorization: Bearer：DeepSeek 文档原话「x-api-key 或
+  // Authorization 任一种」、Anthropic 官方两个都收，而 Authorization 几乎在每个
+  // 站点的 CORS allow-headers 里，x-api-key 经常不在（StepFun 就是）
   keyHeader: function (headers) {
-    var style = DSE.config.get('demoKeyHeader') || 'x-api-key';
     var key = (DSE.config.get('demoKey') || '').trim();
-    if (!key) return headers;                       // 未覆盖 Key 时用 demo 原样头
-    var h = {};
-    for (var k in headers) if (Object.prototype.hasOwnProperty.call(headers, k)) h[k] = headers[k];
-    delete h['x-api-key']; delete h['Authorization']; delete h['authorization'];
-    if (style === 'authorization') h['Authorization'] = 'Bearer ' + key;
-    else h['x-api-key'] = key;
+    if (!key) {
+      // 没覆盖 Key：取页面原始请求里那个，但同样换成 Authorization
+      key = (headers && (headers['x-api-key'] || headers['X-API-Key'] || headers['X-Api-Key'])) || '';
+    }
+    var h = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
+    if (key) h['Authorization'] = 'Bearer ' + key;
     return h;
   },
 
@@ -143,14 +151,20 @@ var DemoBridge = {
     return { url: this.normUrl((DSE.config.get('demoEndpoint') || '').trim()), headers: this.keyHeader(origHeaders), body: out };
   },
 
-  // 端点 URL 归一：与 demoapi.patchFetch 同一套逻辑——配置可以带或不带
-  // /messages（界面说明是不带），两种填法都归一成完整接口地址。此前
-  // buildOutbound 直接用配置原值，不带 /messages 时会 404（只因历史配置
-  // 带了后缀才没暴露）
+  // 端点 URL 归一。三种填法都要认（2026-11-18 实测：StepFun 官方文档给的 Base
+  // URL 就是第一种「只到 /step_plan」，旧代码只会补 /messages，于是被补成
+  // .../step_plan/messages——真实地址是 .../step_plan/v1/messages，直接 404；
+  // 而 StepFun 的 404 不带 CORS 头，浏览器只报 Failed to fetch，用户完全看不出
+  // 是地址填错了）：
+  //   ① 完整地址  .../v1/messages                        → 原样用
+  //   ② 到版本号  .../v1                                 → 补 /messages
+  //   ③ 只给 base https://api.stepfun.com/step_plan      → 补 /v1/messages（Anthropic 约定）
   normUrl: function (ep) {
     ep = String(ep || '').replace(/\/+$/, '');
     if (!ep) return '';
-    return /\/messages$/.test(ep) ? ep : ep + '/messages';
+    if (/\/messages$/.test(ep)) return ep;
+    if (/\/v\d+$/.test(ep)) return ep + '/messages';
+    return ep + '/v1/messages';
   },
 
   /* ---------- SSE 工具 ---------- */
@@ -338,7 +352,7 @@ var DemoBridge = {
   //    thinking:{disabled}（响应仍只回 thinking 块），256 预算会被思考全吃光、
   //    文本块轮不到（stop_reason=max_tokens）→ 故取 1024（与设置里测试按钮
   //    同款，实测思考+文本都放得下）。URL/headers 复用主出站（已按
-  //    demoKeyHeader 处理过 Key），不另起配置。与主回答并行发起，延迟被掩盖；
+  // keyHeader 已统一处理 Key），不另起配置。与主回答并行发起，延迟被掩盖；
   //    失败/空结果退回首条消息截断。费用走第三方端点，不产生 DeepSeek 模型费
   runTitleLegModel: function (firstUser, outbound, signal) {
     var self = this;

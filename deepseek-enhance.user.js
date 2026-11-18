@@ -162,7 +162,6 @@ var DEFAULT_CONFIG = {
   demoModel: '',                         // chat-demo 页模型覆盖（空=用官方默认 deepseek-flash）
   demoCtxLimit: 128000,                   // 自定义模型的上下文窗口（tokens，用于占用环百分比；按所用模型自行调整）
   demoToolMode: 'native',                // 自定义端点时的工具调用方式：native=DeepSeek 模型在对话中驱动搜索（含模型 token 费）/ searchapi=直调独立搜索 API（仅付 $0.75/1000 次）
-  demoKeyHeader: 'x-api-key',            // 覆盖 Key 的请求头写法：x-api-key / authorization（StepFun 等只放行 Authorization）
   demoBridge: 'auto',                   // 第三方端点时的工具桥接：auto(端点非 deepseek 即启用) / on / off
   demoTitleSource: 'deepseek',          // 第三方端点时的会话标题来源：deepseek=起名腿打 DeepSeek 官方端点（title 参数，约 $0.001/次）/ model=当前自定义模型按提示词起名（费用走第三方）/ off=不起名，用首条消息截断
 
@@ -2655,7 +2654,7 @@ DSE.modules.buttons = Buttons;
  *     代码注释与交付说明——解耦需要客户端 agent 桥接，未做。
  * ============================================================ */
 var DemoApi = {
-  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', keyHeader: 'demoKeyHeader', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
+  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
   DEFAULT_BASE: 'https://api.deepseek.com/anthropic/v1',
   // 模型输入建议（datalist），不限制手输
   HINTS: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-flash'],
@@ -2712,6 +2711,14 @@ var DemoApi = {
     return (v == null) ? '' : String(v);
   },
   base: function () { return this.cfg('endpoint').replace(/\/+$/, ''); },
+  // 完整接口地址（含 /messages）。与 demobridge.normUrl 同一套归一逻辑——
+  // 只填 base（StepFun 文档就是这格式）时补 /v1/messages，别再 404
+  fullUrl: function () {
+    var ep = this.base();
+    if (!ep) return '';
+    var B = DSE.modules.demoBridge;
+    return (B && B.normUrl) ? B.normUrl(ep) : ep + '/messages';
+  },
 
   /* ---------- 请求改写：端点 / Key / 模型 ---------- */
   patchFetch: function () {
@@ -2732,8 +2739,9 @@ var DemoApi = {
           var base = self.base(), key = self.cfg('key'), model = self.cfg('model');
           // 页面原始 DeepSeek Key（供桥接的搜索腿使用，先于任何覆盖捕获）
           var origDsKey = (init && init.headers && (init.headers['x-api-key'] || init.headers['X-API-Key'] || init.headers['X-Api-Key'])) || '';
-          // 1) 端点：替换 base（已带 /messages 则原样用）
-          if (base) url = /\/messages$/.test(base) ? base : base + '/messages';
+          // 1) 端点：换成完整接口地址（fullUrl 已按 base/v1/messages 三种填法归一）
+          var full = self.fullUrl();
+          if (full) url = full;
           // 2) 请求头：x-api-key
           if (key && init && init.headers) {
             var h = {};
@@ -2958,7 +2966,7 @@ var DemoApi = {
 
     // 端点/Key 两行的说明较长，既放可见描述行（withDesc），也放输入框
     // hover 提示（title），两处共用同一字符串
-    var ENDPOINT_DESC = DSE.t('只填消息接口地址：到 /messages 为止，不要包含 /messages 本身（例：https://api.stepfun.com/step_plan/v1）。留空 = 官方 ' + DemoApi.DEFAULT_BASE);
+    var ENDPOINT_DESC = DSE.t('填 Base URL 或完整地址都认：https://api.stepfun.com/step_plan（文档里的 Base URL）、https://api.stepfun.com/step_plan/v1、或 .../v1/messages，脚本自动补全。留空 = 官方 ' + DemoApi.DEFAULT_BASE);
     var KEY_DESC = DSE.t('留空 = 用官方设置里填的 Key；填写则替换请求头 x-api-key');
     cfgBox.appendChild(withDesc(mkRow('API 端点', 'endpoint', DemoApi.DEFAULT_BASE, ENDPOINT_DESC), ENDPOINT_DESC));
     cfgBox.appendChild(withDesc(mkRow('API Key', 'key', DSE.t('（用页面里填的官方 Key）'), KEY_DESC, true), KEY_DESC));
@@ -3021,17 +3029,14 @@ var DemoApi = {
       testResult.style.color = 'inherit';
       testResult.textContent = DSE.t('测试中…');
       var t0 = Date.now();
-      var base = self.base() || DemoApi.DEFAULT_BASE;
-      var u = /\/messages$/.test(base) ? base : base.replace(/\/+$/, '') + '/messages';
+      var u = self.fullUrl() || (DemoApi.DEFAULT_BASE.replace(/\/+$/, '') + '/messages');
       var model = (DSE.config.get('demoModel') || '').trim() || 'deepseek-flash';
       // Key：覆盖值优先；否则取页面里填的官方 Key（demo 存于 localStorage）
       var key = (DSE.config.get('demoKey') || '').trim();
       if (!key) { try { key = localStorage.getItem('chat-demo:api-key') || ''; } catch (e) {} }
+      // 与桥接同一套：只用 Authorization: Bearer（详见 demobridge.keyHeader 注释）
       var headers = { 'Content-Type': 'application/json' };
-      if (key) {
-        if ((DSE.config.get('demoKeyHeader') || 'x-api-key') === 'authorization') headers['Authorization'] = 'Bearer ' + key;
-        else headers['x-api-key'] = key;
-      }
+      if (key) headers['Authorization'] = 'Bearer ' + key;
       (DemoApi._origFetch || window.fetch)(u, {
         method: 'POST', headers: headers,
         body: JSON.stringify({
@@ -3101,9 +3106,6 @@ var DemoApi = {
     advBox.appendChild(withDesc(mkRow('上下文窗口', 'ctxLimit', '128000',
       DSE.t('所用模型的上下文窗口（tokens）。可填 128000，也可写 128k / 1m。输入框旁的圆圈按 占用/窗口 显示百分比'), false, null, null),
       DSE.t('所用模型的上下文窗口（tokens）。可填 128000，也可写 128k / 1m。输入框旁的圆圈按 占用/窗口 显示百分比')));
-    advBox.appendChild(withDesc(mkSelect('Key 请求头', 'keyHeader',
-      [['x-api-key', 'x-api-key（默认）'], ['authorization', 'authorization（Bearer）']], 'x-api-key'),
-      '个别网站（如 StepFun）的浏览器安全策略只认 Authorization 请求头，连不上时改选 authorization'));
     advBox.appendChild(withDesc(mkSelect('搜索来源', 'bridge',
       [['auto', 'auto：DeepSeek 原生搜索'], ['off', 'off：用模型自带的']], 'auto'),
       'auto=换第三方模型时，搜索仍由 DeepSeek 原生执行、界面原样呈现（推荐）；off=完全使用第三方自己的能力（多数没有搜索）'));
@@ -3908,15 +3910,23 @@ var DemoBridge = {
     return (DSE.modules.demoApi && DSE.modules.demoApi._origFetch) || window.fetch;
   },
 
+  // 出站头：只发最小必要集，绝不照抄页面原始头。
+  // 2026-11-18 实测（StepFun）：页面请求自带 anthropic-version、x-ds-trace-id
+  // 和一个小写 content-type，桥接原先连它们一起转发——而这些头不在 StepFun 的
+  // CORS allow-headers 里，浏览器预检直接失败、只报 TypeError: Failed to fetch，
+  // 用户完全看不出是哪个头被拒。只发 Content-Type / Accept / Authorization
+  // 三个头，同一条请求立刻 200。
+  // Key 一律放 Authorization: Bearer：DeepSeek 文档原话「x-api-key 或
+  // Authorization 任一种」、Anthropic 官方两个都收，而 Authorization 几乎在每个
+  // 站点的 CORS allow-headers 里，x-api-key 经常不在（StepFun 就是）
   keyHeader: function (headers) {
-    var style = DSE.config.get('demoKeyHeader') || 'x-api-key';
     var key = (DSE.config.get('demoKey') || '').trim();
-    if (!key) return headers;                       // 未覆盖 Key 时用 demo 原样头
-    var h = {};
-    for (var k in headers) if (Object.prototype.hasOwnProperty.call(headers, k)) h[k] = headers[k];
-    delete h['x-api-key']; delete h['Authorization']; delete h['authorization'];
-    if (style === 'authorization') h['Authorization'] = 'Bearer ' + key;
-    else h['x-api-key'] = key;
+    if (!key) {
+      // 没覆盖 Key：取页面原始请求里那个，但同样换成 Authorization
+      key = (headers && (headers['x-api-key'] || headers['X-API-Key'] || headers['X-Api-Key'])) || '';
+    }
+    var h = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
+    if (key) h['Authorization'] = 'Bearer ' + key;
     return h;
   },
 
@@ -3989,14 +3999,20 @@ var DemoBridge = {
     return { url: this.normUrl((DSE.config.get('demoEndpoint') || '').trim()), headers: this.keyHeader(origHeaders), body: out };
   },
 
-  // 端点 URL 归一：与 demoapi.patchFetch 同一套逻辑——配置可以带或不带
-  // /messages（界面说明是不带），两种填法都归一成完整接口地址。此前
-  // buildOutbound 直接用配置原值，不带 /messages 时会 404（只因历史配置
-  // 带了后缀才没暴露）
+  // 端点 URL 归一。三种填法都要认（2026-11-18 实测：StepFun 官方文档给的 Base
+  // URL 就是第一种「只到 /step_plan」，旧代码只会补 /messages，于是被补成
+  // .../step_plan/messages——真实地址是 .../step_plan/v1/messages，直接 404；
+  // 而 StepFun 的 404 不带 CORS 头，浏览器只报 Failed to fetch，用户完全看不出
+  // 是地址填错了）：
+  //   ① 完整地址  .../v1/messages                        → 原样用
+  //   ② 到版本号  .../v1                                 → 补 /messages
+  //   ③ 只给 base https://api.stepfun.com/step_plan      → 补 /v1/messages（Anthropic 约定）
   normUrl: function (ep) {
     ep = String(ep || '').replace(/\/+$/, '');
     if (!ep) return '';
-    return /\/messages$/.test(ep) ? ep : ep + '/messages';
+    if (/\/messages$/.test(ep)) return ep;
+    if (/\/v\d+$/.test(ep)) return ep + '/messages';
+    return ep + '/v1/messages';
   },
 
   /* ---------- SSE 工具 ---------- */
@@ -4184,7 +4200,7 @@ var DemoBridge = {
   //    thinking:{disabled}（响应仍只回 thinking 块），256 预算会被思考全吃光、
   //    文本块轮不到（stop_reason=max_tokens）→ 故取 1024（与设置里测试按钮
   //    同款，实测思考+文本都放得下）。URL/headers 复用主出站（已按
-  //    demoKeyHeader 处理过 Key），不另起配置。与主回答并行发起，延迟被掩盖；
+  // keyHeader 已统一处理 Key），不另起配置。与主回答并行发起，延迟被掩盖；
   //    失败/空结果退回首条消息截断。费用走第三方端点，不产生 DeepSeek 模型费
   runTitleLegModel: function (firstUser, outbound, signal) {
     var self = this;

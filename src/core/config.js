@@ -35,7 +35,6 @@ var DEFAULT_CONFIG = {
   demoModel: '',                         // chat-demo 页模型覆盖（空=用官方默认 deepseek-flash）
   demoCtxLimit: 128000,                   // 自定义模型的上下文窗口（tokens，用于占用环百分比；按所用模型自行调整）
   demoToolMode: 'native',                // 自定义端点时的工具调用方式：native=DeepSeek 模型在对话中驱动搜索（含模型 token 费）/ searchapi=直调独立搜索 API（仅付 $0.75/1000 次）
-  demoKeyHeader: 'x-api-key',            // 覆盖 Key 的请求头写法：x-api-key / authorization（StepFun 等只放行 Authorization）
   demoBridge: 'auto',                   // 第三方端点时的工具桥接：auto(端点非 deepseek 即启用) / on / off
   demoTitleSource: 'deepseek',          // 第三方端点时的会话标题来源：deepseek=起名腿打 DeepSeek 官方端点（title 参数，约 $0.001/次）/ model=当前自定义模型按提示词起名（费用走第三方）/ off=不起名，用首条消息截断
 
