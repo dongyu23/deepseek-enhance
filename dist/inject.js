@@ -83,7 +83,7 @@ var Bridge = {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DSE = window.DSE = {
-  version: '8.9.0',
+  version: '8.8.9',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   bridge: Bridge,
   modules: {},
@@ -3709,19 +3709,9 @@ var DemoBridge = {
   keyHeader: function (headers) {
     var style = DSE.config.get('demoKeyHeader') || 'x-api-key';
     var key = (DSE.config.get('demoKey') || '').trim();
+    if (!key) return headers;                       // 未覆盖 Key 时用 demo 原样头
     var h = {};
     for (var k in headers) if (Object.prototype.hasOwnProperty.call(headers, k)) h[k] = headers[k];
-    // anthropic-beta 必须剥掉：页面**只在请求引用了上传文件时**才加这个头
-    // （DeepSeek Files API 的 beta 标志，官方文档要求引用 file_id 时带上）。
-    // 第三方端点既不认它、CORS 预检白名单里也没有它——带着发出去，浏览器在
-    // 预检阶段直接拦掉，表现为一条莫名的 "Failed to fetch"（2026-11-18 实测：
-    // 带头 100% 被拒、不带 200；这正是"纯文本能发、一带附件就发不出去"的真因）。
-    // 端点仍是 DeepSeek 自己时保留（那边要靠这个头才能用 document 块）
-    var ep = (DSE.config.get('demoEndpoint') || '').toLowerCase();
-    if (ep && ep.indexOf('api.deepseek.com') === -1) {
-      delete h['anthropic-beta']; delete h['Anthropic-Beta']; delete h['ANTHROPIC-BETA'];
-    }
-    if (!key) return h;                       // 未覆盖 Key 时用 demo 原样头
     delete h['x-api-key']; delete h['Authorization']; delete h['authorization'];
     if (style === 'authorization') h['Authorization'] = 'Bearer ' + key;
     else h['x-api-key'] = key;
@@ -3754,7 +3744,7 @@ var DemoBridge = {
         var rec = fileTexts[c.source.file_id];
         var nm = (rec && rec.name) || c.source.file_id || 'file';
         if (rec && typeof rec.text === 'string') {
-          return { type: 'text', text: '【附件：' + nm + '】\n' + rec.text };
+          return { type: 'text', text: '【附件：' + nm + '】\n' + rec.text + (rec.truncated ? '\n（正文过长，已截断）' : '') };
         }
         return { type: 'text', text: '【附件：' + nm + '，当前模型无法读取该类型文件的内容，已忽略】' };
       });
@@ -3770,31 +3760,6 @@ var DemoBridge = {
       var p = reminder.split(',');
       system += '\n\n当前时间：' + (p[0] || '') + ' ' + (p[1] || '') + '；语言：' + (p[4] || '中文') + '；平台：' + (p[3] || 'Web') + '。';
     }
-    // 两种工具调用方式在**出站形状**上就分道：
-    //
-    // searchapi（原生搜索）：只声明第三方端点自己的服务端搜索工具
-    // （StepFun 是 web_search_20250305，实测只认这一个 type，其余一律 400）。
-    // 模型用它原生的通道表达搜索意图——不吐 tool_use JSON、由服务端在执行前
-    // 把意图块吐出来（实测：块收尾时 query 已完整，此刻 abort 则结果块不会
-    // 出现，模型看不到上游搜索结果）。桥接截获这个意图，改由 DeepSeek 的
-    // 独立搜索 API 执行，再把结果按官方同形状合成块喂回模型和界面。
-    // 客户端工具（web_search/read_url + 中文 description + 提示词规程）整套
-    // 不再需要——那套正是模型漏用 read_url、每轮反复吐 JSON 的来源。
-    //
-    // native：保持原状——声明标准客户端工具，模型吐 tool_use，桥接跑
-    // DeepSeek 模型腿做真正的多跳调研（含模型 token 费）
-    var mode = DSE.config.get('demoToolMode') || 'native';
-    var out = {
-      model: (DSE.config.get('demoModel') || '').trim() || body.model,
-      max_tokens: 8192,
-      stream: true,
-      system: system,
-      messages: messages
-    };
-    if (mode === 'searchapi') {
-      out.tools = [{ type: 'web_search_20250305', name: 'web_search' }];
-      return { url: this.normUrl((DSE.config.get('demoEndpoint') || '').trim()), headers: this.keyHeader(origHeaders), body: out };
-    }
     // 工具规程：两个工具是**配合**使用的，必须把分工写明白。此前只点名两个
     // 工具名、不说怎么配合，模型会在思维链里把 read_url 当成"文本提到但函数
     // 列表里没有"的东西、从而整轮不调用它（2026-11-18 用户实测反馈）——工具
@@ -3803,7 +3768,6 @@ var DemoBridge = {
       '需要最新或外部信息时必须调用工具，不要凭空回答。两个工具配合使用：先用 web_search 找到相关网页，' +
       '需要核实细节（日期、数字、原文表述）时再用 read_url 读取其中网页全文。' +
       '同一轮回答中 web_search 不超过 2 次，尽量一次搜准。调用工具前不要输出面向用户的文本。';
-    out.system = system;
     var tools = [
       { name: 'web_search', description: '搜索网页获取实时信息，返回标题/链接/摘要列表。需要最新或外部信息时先用本工具。',
         input_schema: { type: 'object', properties: { query: { type: 'string', description: '搜索查询词' } }, required: ['query'] } }
@@ -3812,7 +3776,14 @@ var DemoBridge = {
     // 直调独立 Fetch API（/v1/tools/fetch）
     tools.push({ name: 'read_url', description: '读取指定网页的全文内容。搜索结果里需要核实细节（日期、数字、原文表述）时，用本工具打开对应链接。',
       input_schema: { type: 'object', properties: { url: { type: 'string', description: '网页 URL' } }, required: ['url'] } });
-    out.tools = tools;
+    var out = {
+      model: (DSE.config.get('demoModel') || '').trim() || body.model,
+      max_tokens: 8192,
+      stream: true,
+      system: system,
+      messages: messages,
+      tools: tools
+    };
     return { url: this.normUrl((DSE.config.get('demoEndpoint') || '').trim()), headers: this.keyHeader(origHeaders), body: out };
   },
 
@@ -3838,13 +3809,7 @@ var DemoBridge = {
     var buf = '';
     return (async function () {
       while (true) {
-        if (signal && signal.aborted) {
-          // cancel() 返回 promise，流已 abort 时它会 reject——不接就是 unhandled
-          // rejection（每次劫持搜索都往控制台抛一条 "BodyStreamBuffer was
-          // aborted"）。try/catch 只拦同步抛，接不住 promise 拒绝
-          try { reader.cancel().catch(function () {}); } catch (e) {}
-          throw new DOMException('Aborted', 'AbortError');
-        }
+        if (signal && signal.aborted) { try { reader.cancel(); } catch (e) {} throw new DOMException('Aborted', 'AbortError'); }
         var r = await reader.read();
         if (r.done) break;
         buf += dec.decode(r.value, { stream: true });
@@ -3864,206 +3829,71 @@ var DemoBridge = {
     })();
   },
 
-  /* ---------- 从模型的工具调用意图里取出查询词 ---------- */
-  // 意图块有三种形状（服务端 server_tool_use / 客户端 tool_use / DeepSeek 方言），
-  // 且模型在历史里见过合成块后有概率把 queries 写成字符串化的数组。统一在这里
-  // 归一，调用方只管拿字符串
-  firstQuery: function (intent) {
-    if (!intent || typeof intent !== 'object') return '';
-    var o = intent.input && typeof intent.input === 'object' ? intent.input : intent;
-    var qs = o.queries;
-    if (typeof qs === 'string') {
-      // 字符串化的数组：按数组解析；解析不动就整串当查询词
-      try { var p = JSON.parse(qs); if (Array.isArray(p) && p.length) qs = p; } catch (e) {}
-      if (typeof qs === 'string') return qs.trim();
-    }
-    if (Array.isArray(qs) && qs.length) return String(qs[0] || '').trim();
-    return String(o.query || '').trim();
-  },
-
+  /* ---------- DeepSeek 极小搜索腿 ---------- */
+  // 返回 {blocks:[...原生工具/思考块...], text:腿的报告, usage}
   /* ---------- DeepSeek 独立搜索腿（searchapi 模式：只付搜索费） ---------- */
   // 直调 POST https://api.deepseek.com/v1/tools/search（Bearer 鉴权，用页面里
   // 同一把 DeepSeek Key），不发起模型对话——没有模型 token 费，只按次计搜索
   // 费（$0.75/1000 次，空结果不计费）。结果按 demo 解析器规范合成原生形状的
-  // server_tool_use / web_search_tool_result 块：一份推给界面，一份由调用方
-  // 塞回请求历史当模型的 grounding。
-  //
-  // 只做字段搬运，不加料：块里只有官方 web_search_result 本就有的那几个字段
-  // （type/title/url/snippet/site_name/site_icon/page_age），snippet 直接用
-  // 接口回的摘要。曾把网页全文塞进额外的 content 字段让模型"不必再读网页"——
-  // 那是我们自己加的东西，官方协议里没有，已删（2026-11-18 用户指出"我让你
-  // 做的只有转发、路由"）。于是 searchapi 只有搜索、没有读网页：官方那对是
-  // 「搜索给摘要 + read_url 补全文」，而 StepFun 没有服务端读网页工具可劫持
-  // （web_fetch_20250305 实测 400），与其加料不如让模型自己决定再搜几次
-  runLegSearchApi: function (query, dsKey, push, nextIdx, signal) {
+  // server_tool_use / web_search_tool_result 块转发，界面呈现与 native 一致
+  runLegSearchApi: function (toolName, toolInput, dsKey, push, nextIdx, signal) {
     var self = this;
-    var q = String(query || '').slice(0, 128);
-    if (!q) return Promise.reject(new Error('empty query'));
+    var isRead = toolName === 'read_url';
+    var q = isRead ? String((toolInput || {}).url || '') : String((toolInput || {}).query || '').slice(0, 128);
+    if (!q) return Promise.reject(new Error('empty input'));
     var ac = new AbortController();
     var timer = setTimeout(function () { ac.abort(); }, 20000);
     if (signal) signal.addEventListener('abort', function () { ac.abort(); }, { once: true });
-    return this.nativeFetch()('https://api.deepseek.com/v1/tools/search', {
+    var url = isRead ? 'https://api.deepseek.com/v1/tools/fetch' : 'https://api.deepseek.com/v1/tools/search';
+    var reqBody = isRead ? { url: q } : { query: q, count: 10, need_content: false };
+    return this.nativeFetch()(url, {
       method: 'POST', signal: ac.signal,
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + dsKey },
-      body: JSON.stringify({ query: q, count: 10, need_content: false })
+      body: JSON.stringify(reqBody)
     }).then(function (resp) {
       clearTimeout(timer);
-      if (!resp.ok) throw new Error('search api http ' + resp.status);
+      if (!resp.ok) throw new Error((isRead ? 'fetch' : 'search') + ' api http ' + resp.status);
       return resp.json();
     }).then(function (j) {
       var id = 'srvtoolu_sa_' + Math.random().toString(36).slice(2, 10);
       var i1 = nextIdx(), i2 = nextIdx();
-      var items = ((j && j.results) || []).slice(0, 10).map(function (r) {
-        return { type: 'web_search_result', title: r.title || '', url: r.url || '',
-          snippet: r.snippet || r.summary || '', site_name: r.site_name || '',
-          site_icon: r.site_icon || '', page_age: r.date || '' };
-      });
-      var useBlock = { type: 'server_tool_use', id: id, name: 'deepseek_web_search', kind: 'search',
-        input: { action: 'search', queries: [q] } };
-      var resultBlock = { type: 'web_search_tool_result', tool_use_id: id, kind: 'search', content: items };
-      push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i1, content_block: useBlock }));
-      push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i1 }));
-      push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i2, content_block: resultBlock }));
-      push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i2 }));
-      return { blocks: [useBlock, resultBlock] };
+      var toolResultText;
+      if (isRead) {
+        // 读网页：open_page 动作块 + web_fetch_tool_result（content 为单对象）
+        var title = (j && j.title) || q;
+        var content = (j && j.content) || '';
+        push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i1,
+          content_block: { type: 'server_tool_use', id: id, name: 'deepseek_read_url', kind: 'read_link',
+            input: { action: 'open_page', url: q } } }));
+        push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i1 }));
+        push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i2,
+          content_block: { type: 'web_fetch_tool_result', tool_use_id: id, kind: 'read_link',
+            content: { type: 'web_fetch_result', url: q, content: { title: title }, published_at: '' } } }));
+        push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i2 }));
+        toolResultText = (title ? title + '\n' : '') + String(content).slice(0, self.LEG_TEXT_CAP);
+      } else {
+        var results = (j && j.results) || [];
+        push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i1,
+          content_block: { type: 'server_tool_use', id: id, name: 'deepseek_web_search', kind: 'search',
+            input: { action: 'search', queries: [q] } } }));
+        push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i1 }));
+        push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i2,
+          content_block: { type: 'web_search_tool_result', tool_use_id: id, kind: 'search',
+            content: results.slice(0, 10).map(function (r) {
+              return { type: 'web_search_result', title: r.title || '', url: r.url || '',
+                snippet: r.snippet || r.summary || '', site_name: r.site_name || '',
+                site_icon: r.site_icon || '', page_age: r.date || '' };
+            }) } }));
+        push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i2 }));
+        toolResultText = results.slice(0, 10).map(function (r, i) {
+          return (i + 1) + '. ' + (r.title || '') + '\n' + (r.url || '') + '\n' + (r.snippet || r.summary || '');
+        }).join('\n\n') || '（未搜索到结果）';
+      }
+      return { text: toolResultText };
     }).catch(function (e) {
       clearTimeout(timer);
       throw e;
     });
-  },
-
-  /* ---------- searchapi 原生搜索流 ----------
-   * 模型用第三方端点自己的服务端搜索工具表达意图（不吐 tool_use JSON），桥接
-   * 截获意图 → abort 该轮 → 用模型自己决定的查询词调 DeepSeek 搜索 → 合成
-   * 原生块（界面一份、历史一份）→ 带收尾 user 消息重发。
-   *
-   * 四个都已实测的关键点：
-   * 1. server_tool_use 块收尾时 input.query 才完整（input_json_delta 流式到
-   *    达），必须等 content_block_stop 再 abort，否则拿到空 query
-   * 2. 此刻 abort，web_search_tool_result 不会出现——模型看不到上游那次搜索
-   *    的结果，grounding 完全来自 DeepSeek
-   * 3. 重发必须补一条 user 收尾消息：只有 [user, assistant[块]] 时模型会自己
-   *    再去搜（上游搜索照执行、照计费）；补上「请基于上面的搜索结果回答」后
-   *    实测直接依据注入结果作答、不重复搜
-   * 4. 不设轮数上限：模型还想搜就再截一次，与原生多跳同构；要停用页面自带
-   *    的停止按钮（abort 经 signal 传到在途请求）
-   */
-  flowSearchApi: function (o) {
-    var self = this;
-    var messages = o.messages.slice();
-    var stopReason = 'end_turn', lastUsage = null, respModel = '';
-    var acc = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
-    // 官方「深度思考」开关。关着时官方端点不回思考块，这里也把第三方模型的
-    // 思考块丢掉——StepFun 忽略 thinking:{disabled} 照样回思考，原样转发等于
-    // 用户关着开关却看到满屏思考（还常是英文 Meta 独白），那是我们多加的
-    var thinkOn = !!o.thinkOn;
-    return (async function () {
-      while (true) {
-        if (o.ac.signal.aborted) throw new DOMException('Aborted', 'AbortError');
-        // 每轮独立 controller：截到意图只断这一轮，不影响整个交换的 signal
-        var roundAc = new AbortController();
-        o.ac.signal.addEventListener('abort', function () { roundAc.abort(); }, { once: true });
-        var resp = await self.nativeFetch()(o.url, {
-          method: 'POST', signal: roundAc.signal,
-          headers: Object.assign({ 'Content-Type': 'application/json', 'Accept': 'text/event-stream' }, o.headers),
-          body: JSON.stringify(Object.assign({}, o.body, { messages: messages }))
-        });
-        if (!resp.ok) {
-          var et = await resp.text().catch(function () { return ''; });
-          var em = et; try { var ej = JSON.parse(et); em = (ej.error && ej.error.message) || et; } catch (e) {}
-          o.push(self.sseEvent('error', { type: 'error', error: { type: 'api_error',
-            message: '模型端点错误 ' + resp.status + '：' + String(em).slice(0, 200) } }));
-          return { stopReason: 'end_turn', usage: acc, lastUsage: null, model: '', messages: messages };
-        }
-        var intent = null, openIdx = -1, curType = '', partial = '', aborted = false;
-        // 意图块有两种形状：声明服务端工具时模型吐 server_tool_use；但历史里
-        // 一旦出现我们合成的 server_tool_use 块，模型有概率改吐客户端形状的
-        // tool_use（实测：某一轮突然变成 tool_use，stop_reason=tool_use）。两种
-        // 都要当意图接住，否则那一轮会被当成"答完了"直接返回，页面挂在生成中、
-        // 答案只剩搜索前那一句话（2026-11-18 实测踩到）
-        var isIntent = function (t) { return t === 'server_tool_use' || t === 'tool_use'; };
-        await self.pump(resp.body, function (j) {
-          if (j.type === 'message_start' && j.message && j.message.model) respModel = j.message.model;
-          if (j.type === 'content_block_start') {
-            var cb = j.content_block || {};
-            curType = cb.type; partial = ''; openIdx = -1;
-            // index 必须走统一的 nextIdx()：早先直接转发上游的 j.index，而合成
-            // 块用另一套计数器——两套编号撞车，demo 按 index 存块时互相覆盖，
-            // 存进库的消息会丢掉整段搜索（实测 3 次搜索只剩 1 组块）
-            // 意图块不转发、也**不占用 index**：吞掉 START 却仍推 STOP 是畸形
-            // SSE，页面解析到就停止累积，后面所有搜索块整段丢失（实测 5 次搜索
-            // 只存进 1 组）
-            if (cb.type === 'text' || (cb.type === 'thinking' && thinkOn)) {
-              openIdx = o.nextIdx();
-              o.push(self.sseEvent('content_block_start', { type: 'content_block_start', index: openIdx, content_block: cb }));
-            }
-          } else if (j.type === 'content_block_delta') {
-            var d = j.delta || {};
-            if (d.type === 'input_json_delta') {
-              if (isIntent(curType)) partial += d.partial_json || '';
-              return;
-            }
-            if (d.type === 'text_delta' || d.type === 'thinking_delta' || d.type === 'signature_delta') {
-              if (openIdx >= 0 && (curType === 'text' || (curType === 'thinking' && thinkOn))) {
-                o.push(self.sseEvent('content_block_delta', { type: 'content_block_delta', index: openIdx, delta: d }));
-              }
-            }
-          } else if (j.type === 'content_block_stop') {
-            if (isIntent(curType) && !aborted) {
-              aborted = true;
-              try { intent = JSON.parse(partial || '{}'); } catch (e) { intent = {}; }
-              roundAc.abort();     // 拿到完整查询词立刻断，结果块不会漏给模型
-            } else if (openIdx >= 0 && (curType === 'text' || (curType === 'thinking' && thinkOn))) {
-              o.push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: openIdx }));
-              openIdx = -1;
-            }
-            curType = '';
-          } else if (j.type === 'message_delta') {
-            lastUsage = j.usage || lastUsage;
-            if (j.delta && j.delta.stop_reason) stopReason = j.delta.stop_reason;
-          }
-        }, roundAc.signal).catch(function (e) {
-          if (e && e.name !== 'AbortError') throw e;
-        });
-        if (lastUsage) {
-          ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'].forEach(function (k) {
-            if (typeof lastUsage[k] === 'number') acc[k] += lastUsage[k];
-          });
-        }
-        // 被主动 abort 的轮次：文本/思考块可能还开着，补一个 stop 让界面闭合
-        if (openIdx >= 0) {
-          o.push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: openIdx }));
-        }
-        // 查询词兼容三种形状：服务端工具的 {query}、DeepSeek 方言的
-        // {action:'search',queries:[..]}、客户端工具的 {query}。
-        // 坑：模型一旦在历史里见过我们合成的 DeepSeek 方言块，有概率把 queries
-        // 写成**字符串化的数组**（实测 "[\"黄仁勋 NVIDIA 消息\"]"）——此时
-        // queries[0] 取到的是字符串第 0 个字符 "["，整次搜索就废了。必须先按
-        // 数组解析，解析不动才整串当查询词
-        var q = self.firstQuery(intent);
-        if (!q) {
-          // 模型说"我要调工具"却一个可执行的搜索意图都没给出——不能悄悄当答完
-          // （页面会永远转圈、答案只剩搜索前那句话），把错误显式推给界面
-          if (stopReason === 'tool_use') {
-            o.push(self.sseEvent('error', { type: 'error', error: { type: 'api_error',
-              message: '模型请求了工具调用但未给出可执行的搜索关键词，已中止本次回答' } }));
-          }
-          return { stopReason: stopReason, usage: acc, lastUsage: lastUsage, model: respModel, messages: messages };
-        }
-        var leg = await self.runLegSearchApi(q, o.dsKey, o.push, o.nextIdx, o.ac.signal);
-        // 新块并进**同一条** assistant 消息——原生就是一条 assistant 消息里串着
-        // 一次次搜索的块；追加成两条连续 assistant 消息多数 provider 不接受。
-        // 也不补任何 user 收尾消息：补一句"请基于上面的搜索结果回答"等于替用户
-        // 决定"别再搜了"，用户明说"搜索5次"也会被这句话按死（2026-11-18 实测
-        // 踩到）。模型自己判断够不够，想再搜就再截一次
-        var last = messages[messages.length - 1];
-        if (last && last.role === 'assistant' && Array.isArray(last.content)) {
-          last.content = last.content.concat(leg.blocks);
-        } else {
-          messages.push({ role: 'assistant', content: leg.blocks });
-        }
-      }
-    })();
   },
 
   /* ---------- 极小起名腿（补官方页的 title:{enabled:true} 通道） ---------- */
@@ -4185,11 +4015,10 @@ var DemoBridge = {
     });
   },
 
-  // native 模式专用：让 DeepSeek 的模型（deepseek-flash）带着它自己的服务端
-  // 搜索/读网页工具去调研，腿内的工具块与思考块原样转发 demo，报告文本走
-  // tool_result 喂回第三方模型。searchapi 模式不走这里——它截获的是第三方
-  // 模型的原生意图，由 flowSearchApi 直接调 runLegSearchApi
   runLeg: function (toolName, toolInput, dsKey, push, nextIdx, signal) {
+    if ((DSE.config.get('demoToolMode') || 'native') === 'searchapi') {
+      return this.runLegSearchApi(toolName, toolInput, dsKey, push, nextIdx, signal);
+    }
     var self = this;
     var q = toolName === 'read_url' ? ('请读取并详细总结这个网页的内容：' + (toolInput.url || ''))
                                     : ('请深入调研以下问题，搜索并阅读相关网页，然后给出有据可查的结论：\n' + (toolInput.query || ''));
@@ -4305,26 +4134,13 @@ var DemoBridge = {
           message: { id: 'msg_bridge_' + Math.random().toString(36).slice(2, 10), type: 'message', role: 'assistant',
             model: outbound.body.model, content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }
         }));
+        // 工具循环：与原生行为一致——模型持续调用工具就持续供给结果，
+        // 直到它自己停止调用（给出最终文本回答）。不设轮数上限、不加
+        // 无进展检测之类的认为中断；需要停止时用页面自身的停止按钮
+        // （abort 经 signal 传到在途请求，流关闭，demo 显示“已停止”）
         var messages = outbound.body.messages.slice();
         var stopReason = 'end_turn';
-        var roundUsage = null, respModel = '';
-        if ((DSE.config.get('demoToolMode') || 'native') === 'searchapi') {
-          // 原生搜索流：模型用第三方端点自己的服务端搜索工具表达意图（不吐
-          // tool_use JSON），桥接截获意图后改由 DeepSeek 的独立搜索 API 执行。
-          // 与 native 那条循环的区别不只是"谁执行"——native 是声明客户端工具、
-          // 模型吐 JSON、桥接跑 DeepSeek 模型腿；这里模型走原生通道，桥接只
-          // 负责换执行者。两条路都不设轮数上限，停止一律交给页面停止按钮
-          var sa = await self.flowSearchApi({
-            messages: messages, url: outbound.url, headers: outbound.headers, body: outbound.body,
-            push: push, nextIdx: nextIdx, ac: ac, dsKey: dsKey,
-            // 「深度思考」开关：官方关着时端点不回思考块，这里也跟着丢，别把
-            // 第三方模型（忽略 thinking:disabled）硬回来的思考展示给用户
-            thinkOn: !!(body.thinking && body.thinking.type === 'enabled')
-          });
-          stopReason = sa.stopReason; roundUsage = sa.lastUsage; respModel = sa.model;
-          messages = sa.messages;
-          addUsage(sa.usage);
-        } else while (true) {
+        while (true) {
           var resp = await self.nativeFetch()(outbound.url, {
             method: 'POST', signal: ac.signal,
             headers: Object.assign({ 'Content-Type': 'application/json', 'Accept': 'text/event-stream' }, outbound.headers),
@@ -4338,7 +4154,7 @@ var DemoBridge = {
           }
           var blocks = [];       // 本轮完整块（供下一轮历史）
           var partial = {};      // index → 累积 input_json
-          var roundStop = 'end_turn';
+          var roundUsage = null, roundStop = 'end_turn', respModel = '';
           await self.pump(resp.body, function (j) {
             if (j.type === 'message_start' && j.message && j.message.model) respModel = j.message.model;
             if (j.type === 'content_block_start') {
