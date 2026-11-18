@@ -2,7 +2,7 @@
 // @name         DeepSeek Enhance 深度增强
 // @name:en      DeepSeek Enhance
 // @namespace    https://github.com/Hiweny/deepseek-enhance
-// @version      8.8.6
+// @version      8.8.7
 // @description  气泡材质(默认iOS磨砂)/思考自动折叠/代码块自动折叠/中英文界面/Markdown本地美化/LaTeX/图片URL背景/顶栏背景透出/按会话隔离的系统提示词(新对话可先填后发)/防撤回/上下文用量/消息导航(虚拟列表适配)/输入框磨砂/移动端适配
 // @updateURL    https://raw.githubusercontent.com/dongyu23/deepseek-enhance/main/deepseek-enhance.meta.js
 // @downloadURL  https://raw.githubusercontent.com/dongyu23/deepseek-enhance/main/deepseek-enhance.user.js
@@ -106,7 +106,7 @@ var Bridge = {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DSE = window.DSE = {
-  version: '8.8.6',
+  version: '8.8.7',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   bridge: Bridge,
   modules: {},
@@ -304,11 +304,17 @@ var SEL_DEMO = {
   // aria-label 文本匹配，不依赖哈希）
   appTop: '.top-ac14ac',
   sidebarItem: '.item-ff6fc9',
-  // 当前会话在侧边栏里的标记：打开某会话后该项加上 active-ff6fc9（实测背景
-  // 变 rgb(53,54,56)、无 aria 属性可依），会话名在 .title-ff6fc9 里
+  // 当前会话标题在侧边栏里的标记：打开某会话后该项加上 active-ff6fc9（实测背景
+  // 变 rgb(53,54,56)、无 aria 属性可依），会话名在 .title-ff6fc9 里。注意收起
+  // 边栏时这些条目会整个从 DOM 消失，不能作为常驻数据源
   sidebarItemActive: '.item-ff6fc9.active-ff6fc9',
   sidebarItemTitle: '.title-ff6fc9',
   sidebarList: '.section-ac14ac',
+  // 聊天区标题：demo 页自己渲染的当前会话名（收起边栏时依然在），新对话时
+  // 整个元素不存在；无标题会话显示占位"新对话"
+  chatView: '.view-_5fa77',
+  chatHeader: '.header-_5fa77',
+  chatTitle: '.title-_5fa77',
   // demo 是客户端直连 api.deepseek.com：无服务端会话 id、无 history_messages
   // 接口、无 accumulated_token_usage 真值——上下文用量统计整段不适用，
   // 设置面板里对应分区（含"立即重新统计"按钮）据此隐藏。
@@ -2514,6 +2520,52 @@ var DemoApi = {
   // 模型输入建议（datalist），不限制手输
   HINTS: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-flash'],
 
+  /* ---------- 附件正文捕获（file_id → 文本） ----------
+   * 页面把文件 POST 到 /anthropic/v1/files，响应只回 {id,size_bytes,filename,
+   * mime_type}——没有正文。而 DeepSeek 明确不支持下载：GET .../files/{id} 只回
+   * 元数据，GET .../files/{id}/content 404（官方文档原话「上传的原始文件和解析
+   * 结果都不支持下载」）。所以对话请求里的 document/file_id 块**只有 DeepSeek
+   * 自己的模型认**，第三方模型收到就是死引用（StepFun 直接 400 input_invalid，
+   * 且该 400 不带 CORS 头，浏览器只报 Failed to fetch）。
+   * 但上传请求本身就经过这里，FormData 里躺着真正的 File——趁上传时把正文按
+   * file_id 记下来，桥接再内联成文本块，附件就能在自定义模型下用了。
+   * 只记能当文本读的（txt/md/csv/代码/日志…），且有长度上限；图片/PDF/Office
+   * 记不下，桥接会换成一行说明，免得整条请求硬失败。 */
+  FILE_TEXT_CAP: 100000,
+  _fileTexts: {},
+  _textExtRe: /\.(txt|md|csv|tsv|json|log|ya?ml|yml|ini|conf|cfg|html?|css|js|mjs|cjs|ts|tsx|jsx|py|go|java|c|cc|cpp|cxx|h|hpp|rs|rb|sh|bash|zsh|sql|xml|toml|dot|gv|proto|tex|bib|sty|cls|lisp|el|vim|r|lua|pl|pm|php|ps1|bat|cmd|awk|sed|make|mk|cmake|gradle|sbt|scala|kt|kts|swift|m|mm|dart|erl|hrl|ex|exs|clj|hs|lhs|ml|mli|fs|fsi|fsx|nim|cr|d|zig|v|sv|vhd|asm|s)$/i,
+
+  captureFile: function (orig, selfArg, url, init) {
+    var file = null, name = '', type = '';
+    try {
+      var b = init && init.body;
+      if (b && typeof FormData !== 'undefined' && b instanceof FormData) {
+        file = b.get('file');
+        if (file) { name = file.name || ''; type = file.type || ''; }
+      }
+    } catch (e) {}
+    if (!file) return orig.call(selfArg, url, init);
+    return orig.call(selfArg, url, init).then(function (resp) {
+      var bind = function (id) {
+        if (!id) return;
+        var rec = { name: name, type: type };
+        DemoApi._fileTexts[id] = rec;
+        // 只在开着自定义模型时值得存（官方端点下 document 块原生可用）
+        if (!DSE.config.get('demoCustom')) return;
+        var looksText = /^text\//.test(type) || DemoApi._textExtRe.test(name);
+        if (!looksText) return;
+        file.text().then(function (tx) {
+          rec.truncated = tx.length > DemoApi.FILE_TEXT_CAP;
+          rec.text = rec.truncated ? tx.slice(0, DemoApi.FILE_TEXT_CAP) : tx;
+        }).catch(function () {});
+      };
+      try {
+        resp.clone().json().then(function (j) { bind(j && j.id); }, function () {});
+      } catch (e) {}
+      return resp;
+    });
+  },
+
   // 注意：配置值不一定是字符串（如 demoCtxLimit 默认是数字 128000），
   // 直接 .trim() 会抛 TypeError 导致整个设置块注入失败
   cfg: function (k) {
@@ -2531,6 +2583,11 @@ var DemoApi = {
     window.fetch = function (input, init) {
       try {
         var url = typeof input === 'string' ? input : (input && input.url) || '';
+        // 附件上传：顺手记下 file_id → 正文（详见 captureFile 注释）。必须在
+        // 下面的 /messages 分支之前——两者 URL 不重叠，顺序只为少一次判断
+        if (url.indexOf('/anthropic/v1/files') !== -1 && init && init.method === 'POST') {
+          return self.captureFile(orig, this, url, init);
+        }
         // 总开关关闭 = 完全官方逻辑（端点/Key/模型/桥接全部不干预）
         if (url.indexOf('/anthropic/v1/messages') !== -1 && DSE.config.get('demoCustom')) {
           var base = self.base(), key = self.cfg('key'), model = self.cfg('model');
@@ -3693,6 +3750,30 @@ var DemoBridge = {
       if (m.role === 'latest_reminder') { reminder = typeof m.content === 'string' ? m.content : ''; return; }
       messages.push(m);
     });
+    // 附件内联：页面上传文件后只拿到 file_id，而 DeepSeek 明确不支持下载原文件/
+    // 解析结果（GET .../files/{id} 只回元数据、.../content 404，官方文档原话
+    // 「上传的原始文件和解析结果都不支持下载」）——document/file_id 块只有
+    // DeepSeek 自己的模型认，第三方模型收到直接 400（StepFun 实测
+    // input_invalid，且该 400 不带 CORS 头，浏览器只报 Failed to fetch）。
+    // 上传时 demoapi 已把能当文本读的正文按 file_id 记下（见 captureFile），
+    // 这里换成文本块；记不下的（图片/PDF/Office）换成一行说明——留着死引用
+    // 只会让整条请求失败，说明至少能让对话继续
+    var fileTexts = (DSE.modules.demoApi && DSE.modules.demoApi._fileTexts) || {};
+    messages = messages.map(function (m) {
+      if (!Array.isArray(m.content)) return m;
+      var changed = false;
+      var blocks = m.content.map(function (c) {
+        if (!c || c.type !== 'document' || !c.source || c.source.type !== 'file') return c;
+        changed = true;
+        var rec = fileTexts[c.source.file_id];
+        var nm = (rec && rec.name) || c.source.file_id || 'file';
+        if (rec && typeof rec.text === 'string') {
+          return { type: 'text', text: '【附件：' + nm + '】\n' + rec.text + (rec.truncated ? '\n（正文过长，已截断）' : '') };
+        }
+        return { type: 'text', text: '【附件：' + nm + '，当前模型无法读取该类型文件的内容，已忽略】' };
+      });
+      return changed ? Object.assign({}, m, { content: blocks }) : m;
+    });
     var system = typeof body.system === 'string' ? body.system : '';
     // 系统提示词：只删掉官方内置的 DeepSeek 自述（"该助手为DeepSeek，由深度
     // 求索公司创造。"）——换第三方模型时保留它，模型会在思维链里引用该句并
@@ -4466,31 +4547,34 @@ DSE.modules.ctxRing = CtxRing;
 /* ============================================================
  * modules/tabtitle：浏览器标签页标题跟随当前会话名
  *
- * 先说清这不是复刻：官方两个站都不改 document.title——主站 bundle
- * （1.66MB，2026-11-18 实时拉取）逐字 grep 零处 document.title，HTML
- * <title> 静态 "DeepSeek"；demo bundle 同样零处，<title> 静态
- * "API 使用 demo"；vendor 里虽打包了 react-helmet（唯一一处
- * document.title 在它里面），但应用代码 0 处引用 Helmet。本模块是
- * 用户明确要求的新增功能。
+ * 官方公式（主站 bundle 逐字，React 19 metadata hoisting）：
+ *   jsx("title",{children: 标题 ? `标题 - 品牌名` : `品牌名 - chatHtmlTitle`})
+ *   → 实测 "ln(ax+b)高阶导数 - DeepSeek"；无标题时 "DeepSeek - 探索未至之境"
+ * demo  bundle 里**没有**这段代码（jsx("title") 零处），标签页标题永远是
+ * 静态的 "API 使用 demo"——所以这是按官方公式补的新增功能，不是复刻。
  *
- * 数据源用 demo 页侧边栏自己渲染出来的当前会话项：打开某会话后该项
- * 加上 active-ff6fc9（实测），其 .title-ff6fc9 的文本就是当前会话名
- * ——不另读 IndexedDB、不猜会话 id，界面显示什么标签页就显示什么。
- * 换会话 = active 类转移到另一项；改名 = 标题文本变；两者都由同一个
- * 观察器覆盖。新对话（没有任何 active 项）时还原成页面原标题。
+ * 数据源：demo 页聊天区自己渲染出来的当前会话标题 .title-_5fa77。不用
+ * 侧边栏——收起边栏时侧边栏条目会整个从 DOM 消失（实测 47→0），标题就断了；
+ * 聊天区标题在收起时依然在，且换会话/改名都会重渲染。无标题会话该元素显示
+ * 占位"新对话"，按官方语义等同无标题（只有真标题才进标签页）；新对话时该
+ * 元素干脆不存在。两者都回落到页面原标题（demo 没有官方那句 slogan 可替）。
  * ============================================================ */
 var TabTitle = {
+  BRAND: 'DeepSeek',      // 官方 useBrandName() 的值（DSeek 品牌时为 "DSeek"）
+  // demo 页对无标题会话的占位显示（侧边栏/聊天区一致）。两种写法都比一遍：
+  // 页面按浏览器语言渲染，脚本 i18n 可能与页面不同步，漏一种就会把占位当真标题
+  PLACEHOLDERS: ['新对话', 'New chat'],
+
   init: function () {
-    // 只做 demo 页：主站侧边栏类名没实测过（账号禁言中主站 UI 被公告挡
-    // 住，点不开会话），不猜哈希
+    // 只做 demo 页：主站自己会用 React hoisting 改标题，脚本不能插手
     if (location.hostname !== 'cdn.deepseek.com') return;
     var self = this;
     this.orig = document.title;
     Utils.onReady(function () {
       self.sync();
       self.bind();
-      // 兜底自愈：侧边栏容器整体被换掉（会话切换/重渲染）时重新绑。节流
-      // （带前缘）而非防抖——防抖会被连续 DOM 变动不断重置，重建后迟迟不生效
+      // 兜底自愈：聊天区容器整体被换掉（切会话）时重新绑。节流（带前缘）而非
+      // 防抖——防抖会被连续 DOM 变动不断重置，重建后迟迟不生效
       new MutationObserver(Utils.throttle(function () {
         if (!self._host || !self._host.isConnected) self.bind();
         self.sync();
@@ -4498,23 +4582,21 @@ var TabTitle = {
     });
   },
 
-  // 当前会话名 → document.title；无当前会话（新对话）→ 还原原标题
+  // 当前会话名 → "会话名 - DeepSeek"；无标题/新对话 → 页面原标题
   sync: function () {
-    var el = document.querySelector(DSE.SEL.sidebarItemActive);
-    var t = '';
-    if (el) {
-      var te = el.querySelector(DSE.SEL.sidebarItemTitle);
-      t = te ? String(te.textContent || '').trim() : '';
-    }
-    var want = t || this.orig;
+    var el = document.querySelector(DSE.SEL.chatTitle);
+    var t = el ? String(el.textContent || '').trim() : '';
+    if (this.PLACEHOLDERS.indexOf(t) !== -1) t = '';
+    var want = t ? t + ' - ' + this.BRAND : this.orig;
     if (document.title !== want) document.title = want;
   },
 
-  // 精确观察器绑在侧边栏列表容器上：childList 管 active 类转移（换会话），
+  // 精确观察器绑在聊天区标题的父容器上：childList 管元素出现/消失（新对话）、
   // subtree+characterData 管标题文本变化（改名）
   bind: function () {
-    var host = document.querySelector(DSE.SEL.sidebarList) ||
-               (document.querySelector(DSE.SEL.sidebarItem) || {}).parentElement;
+    var el = document.querySelector(DSE.SEL.chatTitle);
+    var host = (el && el.parentElement) || document.querySelector(DSE.SEL.chatHeader) ||
+               document.querySelector(DSE.SEL.chatView);
     if (!host) return;
     if (this._mo) { try { this._mo.disconnect(); } catch (e) {} }
     this._host = host;
