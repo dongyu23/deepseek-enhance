@@ -505,62 +505,12 @@ var DemoBridge = {
         // （abort 经 signal 传到在途请求，流关闭，demo 显示“已停止”）
         var messages = outbound.body.messages.slice();
         var stopReason = 'end_turn';
-        // 长附件降级：内联附件把请求体撑到几百 KB 时，不少端点直接拒（StepFun
-        // 实测拒的时候连 CORS 头都不带，浏览器只报 "Failed to fetch"，真实原因
-        // 全被吞掉）。这种网络级失败重试一次：把内联附件截短，至少让对话能继续
-        var ATTACH_CAP = 20000, retriedShorter = false;
-        var hasBigAttachment = function (msgs) {
-          for (var i = 0; i < msgs.length; i++) {
-            var c = msgs[i] && msgs[i].content;
-            if (!Array.isArray(c)) continue;
-            for (var j = 0; j < c.length; j++) {
-              if (c[j] && c[j].type === 'text' && typeof c[j].text === 'string' &&
-                  c[j].text.indexOf('【附件：') === 0 && c[j].text.length > ATTACH_CAP) return true;
-            }
-          }
-          return false;
-        };
-        var shrinkAttachments = function (msgs) {
-          return msgs.map(function (m) {
-            if (!Array.isArray(m.content)) return m;
-            var changed = false;
-            var blocks = m.content.map(function (c) {
-              if (!c || c.type !== 'text' || typeof c.text !== 'string') return c;
-              if (c.text.indexOf('【附件：') !== 0 || c.text.length <= ATTACH_CAP) return c;
-              changed = true;
-              var nl = c.text.indexOf('\n', c.text.indexOf('】'));
-              var head = nl > 0 ? c.text.slice(0, nl) : c.text.slice(0, 40);
-              var from = nl > 0 ? nl + 1 : 0;
-              return { type: 'text', text: head + '\n（原文过长，已截断为前 ' + ATTACH_CAP + ' 字；完整内容请分段发送）\n' + c.text.substr(from, ATTACH_CAP) };
-            });
-            return changed ? Object.assign({}, m, { content: blocks }) : m;
-          });
-        };
         while (true) {
-          var reqBody = JSON.stringify(Object.assign({}, outbound.body, { messages: messages }));
-          var resp;
-          try {
-            resp = await self.nativeFetch()(outbound.url, {
-              method: 'POST', signal: ac.signal,
-              headers: Object.assign({ 'Content-Type': 'application/json', 'Accept': 'text/event-stream' }, outbound.headers),
-              body: reqBody
-            });
-          } catch (fe) {
-            // 网络级失败（拒时无 CORS 头 / 被挡 / 断网）——带上本次请求体大小，
-            // 否则用户只看到一句 "Failed to fetch"，完全没法判断为什么
-            var detail = '请求失败：' + String(fe && fe.message || fe).slice(0, 120) +
-              '（本次请求体 ' + Math.round(reqBody.length / 1024) + ' KB）';
-            // 请求体不大的话，问题多半不在体积——给个排查方向，别让用户干瞪眼
-            if (reqBody.length < 20000) detail += '。请求体不大，请检查端点地址 / Key / 鉴权头 / 网络';
-            if (!retriedShorter && fe && fe.name === 'TypeError' && hasBigAttachment(messages)) {
-              retriedShorter = true;
-              messages = shrinkAttachments(messages);
-              Utils.toast(DSE.t('附件过长导致端点拒绝，已截断为前 {n} 字重试', { n: ATTACH_CAP }), 5000);
-              continue;
-            }
-            push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: detail } }));
-            finish(); return;
-          }
+          var resp = await self.nativeFetch()(outbound.url, {
+            method: 'POST', signal: ac.signal,
+            headers: Object.assign({ 'Content-Type': 'application/json', 'Accept': 'text/event-stream' }, outbound.headers),
+            body: JSON.stringify(Object.assign({}, outbound.body, { messages: messages }))
+          });
           if (!resp.ok) {
             var et = await resp.text().catch(function () { return ''; });
             var em = et; try { var ej = JSON.parse(et); em = (ej.error && ej.error.message) || et; } catch (e) {}
