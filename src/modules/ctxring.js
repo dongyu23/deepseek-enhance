@@ -193,7 +193,26 @@ var CtxRing = {
 
   // 无数据时的占位载荷：圆圈常驻显示（用户要求），首次对话前显示 0%
   emptyData: function () {
-    return { used: 0, input: 0, cacheRead: 0, cacheCreate: 0, estSys: 0, estTool: 0, estMsg: 0, model: '' };
+    return { used: 0, input: 0, cacheRead: 0, cacheCreate: 0, estSys: 0, estTool: 0, estMsg: 0, model: '', estimated: false };
+  },
+
+  /* ---------- 会话切换感知：换了会话就没有旧会话的数据，圆圈归零 ----------
+   * demo 页「开启新对话」/点侧栏切会话都是纯客户端操作、不发任何请求（实测），
+   * ctx:api 不会因此触发——不处理的话圆圈会一直挂着上一个会话的占用，用户看到
+   * 的就是「开新会话上下文不归零」。
+   * 判据用聊天区的消息条数：它只在真切换/新对话时下降，流式期间只增不减，所以
+   * 不会误伤。别用标题元素当信号——实测流式过程中 .title-_5fa77 会闪断
+   * （移除再加回），那一下子会把刚收到的 usage 抹掉 */
+  syncSession: function () {
+    var SEL = DSE.SEL || {};
+    var n = SEL.msg ? document.querySelectorAll(SEL.msg).length : 0;
+    if (n === this._msgCount) return;
+    var prev = this._msgCount;
+    this._msgCount = n;
+    if (n < prev && this._data && (Number(this._data.used) || 0) > 0) {
+      this.update(this.emptyData());
+      this.hidePanel();
+    }
   },
 
   init: function () {
@@ -272,13 +291,17 @@ var CtxRing = {
       // 工具条会随会话切换重建——保持圆圈在场。节流（带前缘）而非防抖：
       // 防抖会被连续 DOM 变动不断重置，重建后圆圈迟迟不出现
       new MutationObserver(Utils.throttle(function () {
-        if (document.getElementById('dse-ctx-ring')) return;
-        self.inject();
-        // 用 _data（完整对象）重画——传 _last（数字）会走 update 的兜底分支，
-        // 把构成估算数据清零；没有数据也要画（常驻 0%）
-        self.update(self._data || self.emptyData());
-        bindPrecise();
+        if (!document.getElementById('dse-ctx-ring')) {
+          self.inject();
+          // 用 _data（完整对象）重画——传 _last（数字）会走 update 的兜底分支，
+          // 把构成估算数据清零；没有数据也要画（常驻 0%）
+          self.update(self._data || self.emptyData());
+          bindPrecise();
+        }
+        // 同一轮里顺带做会话切换感知：开新对话/切会话都不发请求，靠这个归零
+        self.syncSession();
       }, 100)).observe(document.body, { childList: true, subtree: true });
+      self.syncSession();
     });
   }
 };
