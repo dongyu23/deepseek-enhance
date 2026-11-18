@@ -2,7 +2,7 @@
 // @name         DeepSeek Enhance 深度增强
 // @name:en      DeepSeek Enhance
 // @namespace    https://github.com/Hiweny/deepseek-enhance
-// @version      8.8.3
+// @version      8.8.4
 // @description  气泡材质(默认iOS磨砂)/思考自动折叠/代码块自动折叠/中英文界面/Markdown本地美化/LaTeX/图片URL背景/顶栏背景透出/按会话隔离的系统提示词(新对话可先填后发)/防撤回/上下文用量/消息导航(虚拟列表适配)/输入框磨砂/移动端适配
 // @updateURL    https://raw.githubusercontent.com/dongyu23/deepseek-enhance/main/deepseek-enhance.meta.js
 // @downloadURL  https://raw.githubusercontent.com/dongyu23/deepseek-enhance/main/deepseek-enhance.user.js
@@ -106,7 +106,7 @@ var Bridge = {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DSE = window.DSE = {
-  version: '8.8.3',
+  version: '8.8.4',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   bridge: Bridge,
   modules: {},
@@ -4128,8 +4128,58 @@ var CtxRing = {
 
   init: function () {
     var self = this;
+    // 精确触发：换会话时从工具条到 view 的整条输入子树都会被换掉（实测 5 层
+    // 全灭、只剩聊天内容根节点存活）——所以把 childList 观察器绑在圆圈的**整条
+    // 祖先链**上（最多 8 层）：任一层的子级变动都立刻检查，活着的那个层就会
+    // 在替换发生的同一个 microtask（浏览器绘制前）补注，圆圈不会闪。被换掉
+    // 的层其观察器随之失效（无害），补注后重新绑到新链上
+    var bindPrecise = function () {
+      // 关键：没有圆圈时直接返回、绝不能摘掉现有观察器。早先无条件摘+重绑，
+      // 而 inject() 失败（工具条还没渲染完）时圆圈不存在、新链也走不起来——
+      // 结果观察器被全部摘掉且没绑新的，之后只能等 body 节流兜底（实测掉到
+      // ~117ms）。保留旧观察器，它们会在下一次变异时继续尝试
+      var ring0 = document.getElementById('dse-ctx-ring');
+      if (!ring0) return;
+      (self._barMos || []).forEach(function (mo) { try { mo.disconnect(); } catch (e) {} });
+      self._barMos = [];
+      var ring = ring0;
+      var n = ring && ring.parentElement;
+      var depth = 0, top = null;
+      while (n && n !== document.body && depth < 8) {
+        (function (host) {
+          var mo = new MutationObserver(function () {
+            if (document.getElementById('dse-ctx-ring')) return;
+            self.inject();
+            self.update(self._data || self.emptyData());
+            bindPrecise();          // 新链可能变了——重新绑
+          });
+          mo.observe(host, { childList: true });
+          self._barMos.push(mo);
+        })(n);
+        top = n;
+        n = n.parentElement;
+        depth++;
+      }
+      // 最上层存活节点再加一个 subtree 监听：实测换会话时新工具条外壳先出现
+      // （t≈38ms）、按钮行要到 t≈87ms 才渲染完——只听直接子级变动会在外壳出现
+      // 那刻尝试补注却因按钮行没就绪而失败，之后干等节流兜底。subtree 让按钮行
+      // 渲染完成的那一刻就补上。回调本身只是 getElementById 早退，代价可忽略
+      if (top) {
+        var moTop = new MutationObserver(function () {
+          if (document.getElementById('dse-ctx-ring')) return;
+          self.inject();
+          self.update(self._data || self.emptyData());
+          bindPrecise();
+        });
+        moTop.observe(top, { childList: true, subtree: true });
+        self._barMos.push(moTop);
+      }
+    };
     Utils.onReady(function () {
       self.inject();
+      // 首帧即显示（开着自定义模型时）
+      self.update(self._data || self.emptyData());
+      bindPrecise();
       DSE.on('ctx:api', function (p) { if (p && p.used > 0) self.update(p); });
       // 常驻显隐由总开关决定：关→隐藏；开→立刻显示（没数据时 0%），不必等
       // 首次对话——用户要求圆圈一直显示
@@ -4152,9 +4202,8 @@ var CtxRing = {
         // 用 _data（完整对象）重画——传 _last（数字）会走 update 的兜底分支，
         // 把构成估算数据清零；没有数据也要画（常驻 0%）
         self.update(self._data || self.emptyData());
+        bindPrecise();
       }, 100)).observe(document.body, { childList: true, subtree: true });
-      // 首帧即显示（开着自定义模型时）
-      self.update(self._data || self.emptyData());
     });
   }
 };
