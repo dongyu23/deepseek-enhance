@@ -24,12 +24,15 @@ var Net = {
 
   // fetch 兜底：站点部分链路（如 resume_stream）走 fetch 而非 XHR，以前只改写
   // 请求体、响应整段漏掉——用量统计在这些链路上永远不激活。这里对命中 URL 的
-  // 响应做 clone 旁路解析：原响应照常返回给站点，clone 只读来发事件，互不干扰
+  // 响应做 clone 旁路解析：原响应照常返回给站点，clone 只读来发事件，互不干扰。
+  // 注意必须写到 pageWindow()：油猴沙箱里 window 不是页面的 window，写它等于
+  // 没写（实测 demo 页因此整个桥接不工作、圆圈永远 0）
   _patchFetch: function () {
     var self = this;
-    var origFetch = window.fetch;
+    var win = (typeof pageWindow === 'function') ? pageWindow() : window;
+    var origFetch = win.fetch;
     if (!origFetch) return;
-    window.fetch = function (input, init) {
+    win.fetch = function (input, init) {
       var url = '', isGen = false, isHist = false, ctx = null;
       try {
         url = typeof input === 'string' ? input : (input && input.url) || '';

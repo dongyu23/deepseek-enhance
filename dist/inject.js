@@ -81,10 +81,23 @@ var Bridge = {
   hasGM: HAS_GM
 };
 
+/* ---------- 页面真正的 window ----------
+ * 油猴带 @grant 时把脚本跑在沙箱里，沙箱的 window 不是页面的 window：读会沿
+ * 原型链穿透过去，写只落在沙箱全局。于是 `window.fetch = 补丁` 这种写法页面
+ * 一个字节都没换到——demo 页走 fetch，桥接整个不工作、圆圈永远 0（主站走
+ * XHR、改的是共享原型所以照常，故只有 demo 页炸）。document.defaultView 在
+ * 任何上下文里都指向页面真正的 window，unsafeWindow 是油猴的显式通道 */
+function pageWindow() {
+  try { if (typeof unsafeWindow !== 'undefined' && unsafeWindow) return unsafeWindow; } catch (e) {}
+  try { if (document.defaultView) return document.defaultView; } catch (e) {}
+  return window;
+}
+
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DSE = window.DSE = {
   version: '8.9.0',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
+  pageWindow: pageWindow,
   bridge: Bridge,
   modules: {},
   _ev: {},
@@ -94,6 +107,9 @@ var DSE = window.DSE = {
     for (var i = 0; i < list.length; i++) { try { list[i](payload); } catch (e) { console.error('[DSE]', name, e); } }
   }
 };
+// 沙箱里 window 不是页面的 window——再往页面真正的 window 上挂一份，控制台/
+// 其它脚本才拿得到 DSE（实测沙箱下不挂的话控制台里 DSE is not defined）
+try { var pw = pageWindow(); if (pw && pw !== window) pw.DSE = DSE; } catch (e) {}
 
 DSE.register = function (name, api) { this.modules[name] = api || {}; };
 DSE.log = function () {
@@ -620,12 +636,15 @@ var Net = {
 
   // fetch 兜底：站点部分链路（如 resume_stream）走 fetch 而非 XHR，以前只改写
   // 请求体、响应整段漏掉——用量统计在这些链路上永远不激活。这里对命中 URL 的
-  // 响应做 clone 旁路解析：原响应照常返回给站点，clone 只读来发事件，互不干扰
+  // 响应做 clone 旁路解析：原响应照常返回给站点，clone 只读来发事件，互不干扰。
+  // 注意必须写到 pageWindow()：油猴沙箱里 window 不是页面的 window，写它等于
+  // 没写（实测 demo 页因此整个桥接不工作、圆圈永远 0）
   _patchFetch: function () {
     var self = this;
-    var origFetch = window.fetch;
+    var win = (typeof pageWindow === 'function') ? pageWindow() : window;
+    var origFetch = win.fetch;
     if (!origFetch) return;
-    window.fetch = function (input, init) {
+    win.fetch = function (input, init) {
       var url = '', isGen = false, isHist = false, ctx = null;
       try {
         url = typeof input === 'string' ? input : (input && input.url) || '';
@@ -2698,12 +2717,16 @@ var DemoApi = {
   },
 
   /* ---------- 请求改写：端点 / Key / 模型 ---------- */
+  // 必须写到 pageWindow()：油猴沙箱里 window 不是页面的 window，`window.fetch =`
+  // 只改到沙箱全局、页面的 fetch 原封不动——demo 页整页走 fetch，桥接因此整个
+  // 不工作（圆圈永远 0%，而主站走 XHR 不受影响，故只有 demo 页炸）
   patchFetch: function () {
     var self = this;
-    if (!window.fetch) return;
-    var orig = window.fetch;
+    var win = (typeof pageWindow === 'function') ? pageWindow() : window;
+    if (!win.fetch) return;
+    var orig = win.fetch;
     DemoApi._origFetch = orig;   // 桥接的出站请求走原生 fetch，避开本补丁的 URL 改写（否则搜索腿会被改写到第三方端点）
-    window.fetch = function (input, init) {
+    win.fetch = function (input, init) {
       try {
         var url = typeof input === 'string' ? input : (input && input.url) || '';
         // 附件上传：顺手记下 file_id → 正文（详见 captureFile 注释）。必须在

@@ -94,12 +94,16 @@ var DemoApi = {
   },
 
   /* ---------- 请求改写：端点 / Key / 模型 ---------- */
+  // 必须写到 pageWindow()：油猴沙箱里 window 不是页面的 window，`window.fetch =`
+  // 只改到沙箱全局、页面的 fetch 原封不动——demo 页整页走 fetch，桥接因此整个
+  // 不工作（圆圈永远 0%，而主站走 XHR 不受影响，故只有 demo 页炸）
   patchFetch: function () {
     var self = this;
-    if (!window.fetch) return;
-    var orig = window.fetch;
+    var win = (typeof pageWindow === 'function') ? pageWindow() : window;
+    if (!win.fetch) return;
+    var orig = win.fetch;
     DemoApi._origFetch = orig;   // 桥接的出站请求走原生 fetch，避开本补丁的 URL 改写（否则搜索腿会被改写到第三方端点）
-    window.fetch = function (input, init) {
+    win.fetch = function (input, init) {
       try {
         var url = typeof input === 'string' ? input : (input && input.url) || '';
         // 附件上传：顺手记下 file_id → 正文（详见 captureFile 注释）。必须在
