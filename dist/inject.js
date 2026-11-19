@@ -3984,8 +3984,25 @@ var DemoBridge = {
       '需要核实细节（日期、数字、原文表述）时再用 read_url 读取其中网页全文。' +
       '同一轮回答中 web_search 不超过 2 次，尽量一次搜准。调用工具前不要输出面向用户的文本。';
     var tools = [
-      { name: 'web_search', description: '搜索网页获取实时信息，返回标题/链接/摘要列表。需要最新或外部信息时先用本工具。',
-        input_schema: { type: 'object', properties: { query: { type: 'string', description: '搜索查询词' } }, required: ['query'] } }
+      // web_search 的参数口径与 DeepSeek Search API 对齐（2026-11-19 按其文档补全）：
+      // query 1~128 字符且支持整套搜索语法；count 1~50 且**不影响费用**（按次计费，
+      // 填 50 和填 5 一个价）——此前只声明一个 query，模型既不知道能限定站点/语言/
+      // 时间，也没法多要结果，等于白放一半能力
+      { name: 'web_search',
+        description: '搜索网页获取实时信息，返回标题/链接/摘要列表。需要最新或外部信息时先用本工具。' +
+          'query 支持搜索语法（可组合）：site:example.com 限定站点；多个站点用 site:a.com OR site:b.com；' +
+          '-site:x.com 排除站点；-关键词 排除；"精确短语" 精确匹配；lang:zh-CN 限定语言；' +
+          'after:2026-01-01 / before:2026-06-01 限定发布时间。查近期事件时优先用 after: 收窄。',
+        input_schema: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: '搜索词，1~128 个字符，支持 site: / -site: / -排除词 / "精确短语" / lang: / after: / before: 语法' },
+            count: { type: 'integer', description: '返回条数，1~50，默认 10。条数不影响费用，可按需多要' },
+            need_content: { type: 'boolean', description: '是否在结果中返回网页正文，默认 false。需要引用原文细节时设 true' },
+            ori_question: { type: 'string', description: '触发本次搜索的用户原始问题，1~128 字符，能帮助搜索服务理解意图' }
+          },
+          required: ['query']
+        } }
     ];
     // read_url 两种模式都声明：native 走模型对话内的读网页工具；searchapi
     // 直调独立 Fetch API（/v1/tools/fetch）
@@ -4060,13 +4077,24 @@ var DemoBridge = {
   runLegSearchApi: function (toolName, toolInput, dsKey, push, nextIdx, signal) {
     var self = this;
     var isRead = toolName === 'read_url';
-    var q = isRead ? String((toolInput || {}).url || '') : String((toolInput || {}).query || '').slice(0, 128);
+    var ti = toolInput || {};
+    var q = isRead ? String(ti.url || '') : String(ti.query || '').slice(0, 128);
     if (!q) return Promise.reject(new Error('empty input'));
+    // count：按模型给的走，夹在 API 允许的 1~50；按次计费，多要不加钱
+    var cnt = parseInt(ti.count, 10);
+    if (!(cnt >= 1)) cnt = 10;
+    if (cnt > 50) cnt = 50;
+    // need_content：模型要正文才给（默认 false，此时 API 的 content 恒为空串）
+    var wantContent = ti.need_content === true;
+    // ori_question：模型没传就用会话首条用户消息兜底——官方文档说带上原始问题
+    // 能改善查询理解（智能体内部的检索词往往是压缩过的关键词串）
+    var oriQ = String(ti.ori_question || self._firstUser || '').replace(/\s+/g, ' ').trim().slice(0, 128);
     var ac = new AbortController();
     var timer = setTimeout(function () { ac.abort(); }, 20000);
     if (signal) signal.addEventListener('abort', function () { ac.abort(); }, { once: true });
     var url = isRead ? 'https://api.deepseek.com/v1/tools/fetch' : 'https://api.deepseek.com/v1/tools/search';
-    var reqBody = isRead ? { url: q } : { query: q, count: 10, need_content: false };
+    var reqBody = isRead ? { url: q }
+      : { query: q, count: cnt, need_content: wantContent, ori_question: oriQ || null };
     return this.nativeFetch()(url, {
       method: 'POST', signal: ac.signal,
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + dsKey },
@@ -4100,14 +4128,18 @@ var DemoBridge = {
         push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i1 }));
         push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i2,
           content_block: { type: 'web_search_tool_result', tool_use_id: id, kind: 'search',
-            content: results.slice(0, 10).map(function (r) {
+            content: results.slice(0, cnt).map(function (r) {
               return { type: 'web_search_result', title: r.title || '', url: r.url || '',
                 snippet: r.snippet || r.summary || '', site_name: r.site_name || '',
                 site_icon: r.site_icon || '', page_age: r.date || '' };
             }) } }));
         push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i2 }));
-        toolResultText = results.slice(0, 10).map(function (r, i) {
-          return (i + 1) + '. ' + (r.title || '') + '\n' + (r.url || '') + '\n' + (r.snippet || r.summary || '');
+        // 喂回模型的文本：默认只给标题/URL/摘要（snippet 给人看、summary 给模型读），
+        // 模型显式要正文（need_content）时把 content 也带上
+        toolResultText = results.slice(0, cnt).map(function (r, i) {
+          var s = (i + 1) + '. ' + (r.title || '') + '\n' + (r.url || '') + '\n' + (r.snippet || r.summary || '');
+          if (wantContent && r.content) s += '\n' + String(r.content);
+          return s;
         }).join('\n\n') || '（未搜索到结果）';
       }
       return { text: toolResultText };
@@ -4306,6 +4338,21 @@ var DemoBridge = {
     if (!body || !body.messages) return null;
 
     var outbound = this.buildOutbound(body, init.headers || {});
+    // 会话首条用户消息：搜索腿的 ori_question 兜底（官方文档说带上原始问题能改善
+    // 查询理解——智能体内部的检索词往往是压缩过的关键词串）
+    self._firstUser = (function () {
+      var ms = (body && body.messages) || [];
+      for (var i = 0; i < ms.length; i++) {
+        var m = ms[i];
+        if (m && m.role === 'user' && typeof m.content === 'string' && m.content.trim()) return m.content;
+        if (m && m.role === 'user' && Array.isArray(m.content)) {
+          for (var j = 0; j < m.content.length; j++) {
+            if (m.content[j] && m.content[j].type === 'text' && m.content[j].text) return m.content[j].text;
+          }
+        }
+      }
+      return '';
+    })();
     var enc = new TextEncoder();
     var q = [], done = false, wake = null;
     var push = function (s) { q.push(s); if (wake) { var w = wake; wake = null; w(); } };
