@@ -64,11 +64,25 @@ var DemoApi = {
         if (!id) return;
         var rec = { name: name, type: type };
         DemoApi._fileTexts[id] = rec;
-        // 只在开着自定义模型时值得存（官方端点下 document 块原生可用）
+        // 只在开着自定义模型时值得存（官方端点下 document/image 块原生可用）
         if (!DSE.config.get('demoCustom')) return;
         var looksText = /^text\//.test(type) || DemoApi._textExtRe.test(name);
-        if (!looksText) return;
-        file.text().then(function (tx) { rec.text = tx; }).catch(function () {});
+        if (looksText) {
+          file.text().then(function (tx) { rec.text = tx; }).catch(function () {});
+          return;
+        }
+        // 多模态：图片按 base64 存下来。第三方端点不认 DeepSeek 的 file 引用
+        // （实测 StepFun 报 messages[0].content[0].source.type must be url or
+        // base64），而 DeepSeek 自己的 Files API 又不支持下载原文件——唯一能
+        // 把图片送到第三方模型的办法就是本地读成 base64 内联
+        if (/^image\//.test(type)) {
+          try {
+            var reader = new FileReader();
+            reader.onload = function () { rec.dataUrl = String(reader.result || ''); };
+            reader.onerror = function () { rec.dataUrl = ''; };
+            reader.readAsDataURL(file);
+          } catch (e) {}
+        }
       };
       try {
         resp.clone().json().then(function (j) { bind(j && j.id); }, function () {});

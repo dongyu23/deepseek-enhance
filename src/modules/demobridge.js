@@ -95,17 +95,33 @@ var DemoBridge = {
     });
     // 附件内联：页面上传文件后只拿到 file_id，而 DeepSeek 明确不支持下载原文件/
     // 解析结果（GET .../files/{id} 只回元数据、.../content 404，官方文档原话
-    // 「上传的原始文件和解析结果都不支持下载」）——document/file_id 块只有
-    // DeepSeek 自己的模型认，第三方模型收到直接 400（StepFun 实测
-    // input_invalid，且该 400 不带 CORS 头，浏览器只报 Failed to fetch）。
-    // 上传时 demoapi 已把能当文本读的正文按 file_id 记下（见 captureFile），
-    // 这里换成文本块；记不下的（图片/PDF/Office）换成一行说明——留着死引用
-    // 只会让整条请求失败，说明至少能让对话继续
+    // 「上传的原始文件和解析结果都不支持下载」）——file_id 引用只有 DeepSeek 自己
+    // 的模型认，第三方模型收到直接 400（StepFun 实测 document 报 input_invalid、
+    // image 报 source.type must be url or base64，且 400 不带 CORS 头，浏览器只报
+    // Failed to fetch）。
+    //    document 块 → 能当文本读的换成文本块（上传时已按 file_id 记下正文）；
+    //                  读不了的（PDF/Office）换成一行说明
+    //    image    块 → 上传时读成 base64，这里换成 Anthropic 形状的 base64 块
+    //                   （本地文件没有公网 URL，base64 是唯一能送进第三方模型的路）
+    // 留着死引用只会让整条请求失败，转换/说明至少能让对话继续
     var fileTexts = (DSE.modules.demoApi && DSE.modules.demoApi._fileTexts) || {};
     messages = messages.map(function (m) {
       if (!Array.isArray(m.content)) return m;
       var changed = false;
       var blocks = m.content.map(function (c) {
+        // 图片：DeepSeek 的 file 引用 → base64 内联。第三方端点只认 url/base64
+        // （StepFun 实测报 source.type must be url or base64），本地文件又拿不到
+        // 公网 URL，只能走 base64——上传时 demoapi 已把图像数据按 file_id 记下
+        if (c && c.type === 'image' && c.source && c.source.type === 'file') {
+          changed = true;
+          var ir = fileTexts[c.source.file_id];
+          var du = ir && ir.dataUrl;
+          if (du && du.indexOf('base64,') !== -1) {
+            var mt = ir.mediaType || du.slice(5, du.indexOf(';'));
+            return { type: 'image', source: { type: 'base64', media_type: mt, data: du.slice(du.indexOf('base64,') + 7) } };
+          }
+          return { type: 'text', text: '【图片：' + ((ir && ir.name) || c.source.file_id || 'image') + '，图像数据尚未读取完成，请重试发送】' };
+        }
         if (!c || c.type !== 'document' || !c.source || c.source.type !== 'file') return c;
         changed = true;
         var rec = fileTexts[c.source.file_id];
