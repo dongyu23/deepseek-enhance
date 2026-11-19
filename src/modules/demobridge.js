@@ -115,6 +115,11 @@ var DemoBridge = {
         if (c && c.type === 'image' && c.source && c.source.type === 'file') {
           changed = true;
           var ir = fileTexts[c.source.file_id];
+          // 纯文本模型：不白发 base64（一张图几 MB，token 白烧且多半被拒），
+          // 换成一行说明让对话能继续
+          if (!DSE.config.get('demoMultimodal')) {
+            return { type: 'text', text: '【图片：' + ((ir && ir.name) || c.source.file_id || 'image') + '，当前模型不支持图片输入，已忽略】' };
+          }
           var du = ir && ir.dataUrl;
           if (du && du.indexOf('base64,') !== -1) {
             var mt = ir.mediaType || du.slice(5, du.indexOf(';'));

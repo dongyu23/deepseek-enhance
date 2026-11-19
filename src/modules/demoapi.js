@@ -27,7 +27,7 @@
  *     代码注释与交付说明——解耦需要客户端 agent 桥接，未做。
  * ============================================================ */
 var DemoApi = {
-  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
+  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', multimodal: 'demoMultimodal', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
   DEFAULT_BASE: 'https://api.deepseek.com/anthropic/v1',
   // 模型输入建议（datalist），不限制手输
   HINTS: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-flash'],
@@ -363,6 +363,11 @@ var DemoApi = {
     cfgBox.appendChild(withDesc(mkRow('API Key', 'key', DSE.t('（用页面里填的官方 Key）'), KEY_DESC, true), KEY_DESC));
     cfgBox.appendChild(mkRow('模型', 'model', DSE.t('deepseek-flash（官方默认）'),
       DSE.t('留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段'), false, DemoApi.HINTS, 'dse-model-hints'));
+    // 多模态开关：决定图片怎么发。开=转 base64 内联（多模态模型）；
+    // 关=换成文字说明——纯文本模型即便收到图也是白烧 token，多半还被拒
+    cfgBox.appendChild(withDesc(mkSwitch('模型支持图片（多模态）', 'multimodal',
+      DSE.t('开=图片转 base64 内联发送；关=只发「当前模型不支持图片」的文字说明。纯文本模型请关掉，省 token 也避免被端点拒')),
+      DSE.t('开=图片转 base64 内联发送；关=只发「当前模型不支持图片」的文字说明。纯文本模型请关掉，省 token 也避免被端点拒')));
 
     /* ---------- 保存按钮（放在主字段下方、测试行之前：一眼可见，不用滚动） ----------
      * 这些项本来就是即改即存（输入 300ms 防抖、下拉 change 即时、失焦立即），

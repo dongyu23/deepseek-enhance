@@ -33,6 +33,7 @@ var DEFAULT_CONFIG = {
   demoEndpoint: '',                      // chat-demo 页 API 端点覆盖（空=官方 api.deepseek.com/anthropic/v1；不含 /messages）
   demoKey: '',                           // chat-demo 页 API Key 覆盖（空=用页面里填的官方 Key）
   demoModel: '',                         // chat-demo 页模型覆盖（空=用官方默认 deepseek-flash）
+  demoMultimodal: true,                  // 自定义模型是否支持图片：开=图片转 base64 内联发出；关=换成文字说明（纯文本模型开着也是白搭 token）
   demoCtxLimit: 128000,                   // 自定义模型的上下文窗口（tokens，用于占用环百分比；按所用模型自行调整）
   demoToolMode: 'native',                // 自定义端点时的工具调用方式：native=DeepSeek 模型在对话中驱动搜索（含模型 token 费）/ searchapi=直调独立搜索 API（仅付 $0.75/1000 次）
   demoBridge: 'auto',                   // 第三方端点时的工具桥接：auto(端点非 deepseek 即启用) / on / off

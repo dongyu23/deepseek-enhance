@@ -176,6 +176,7 @@ var DEFAULT_CONFIG = {
   demoEndpoint: '',                      // chat-demo 页 API 端点覆盖（空=官方 api.deepseek.com/anthropic/v1；不含 /messages）
   demoKey: '',                           // chat-demo 页 API Key 覆盖（空=用页面里填的官方 Key）
   demoModel: '',                         // chat-demo 页模型覆盖（空=用官方默认 deepseek-flash）
+  demoMultimodal: true,                  // 自定义模型是否支持图片：开=图片转 base64 内联发出；关=换成文字说明（纯文本模型开着也是白搭 token）
   demoCtxLimit: 128000,                   // 自定义模型的上下文窗口（tokens，用于占用环百分比；按所用模型自行调整）
   demoToolMode: 'native',                // 自定义端点时的工具调用方式：native=DeepSeek 模型在对话中驱动搜索（含模型 token 费）/ searchapi=直调独立搜索 API（仅付 $0.75/1000 次）
   demoBridge: 'auto',                   // 第三方端点时的工具桥接：auto(端点非 deepseek 即启用) / on / off
@@ -2673,7 +2674,7 @@ DSE.modules.buttons = Buttons;
  *     代码注释与交付说明——解耦需要客户端 agent 桥接，未做。
  * ============================================================ */
 var DemoApi = {
-  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
+  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', multimodal: 'demoMultimodal', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
   DEFAULT_BASE: 'https://api.deepseek.com/anthropic/v1',
   // 模型输入建议（datalist），不限制手输
   HINTS: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-flash'],
@@ -3009,6 +3010,11 @@ var DemoApi = {
     cfgBox.appendChild(withDesc(mkRow('API Key', 'key', DSE.t('（用页面里填的官方 Key）'), KEY_DESC, true), KEY_DESC));
     cfgBox.appendChild(mkRow('模型', 'model', DSE.t('deepseek-flash（官方默认）'),
       DSE.t('留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段'), false, DemoApi.HINTS, 'dse-model-hints'));
+    // 多模态开关：决定图片怎么发。开=转 base64 内联（多模态模型）；
+    // 关=换成文字说明——纯文本模型即便收到图也是白烧 token，多半还被拒
+    cfgBox.appendChild(withDesc(mkSwitch('模型支持图片（多模态）', 'multimodal',
+      DSE.t('开=图片转 base64 内联发送；关=只发「当前模型不支持图片」的文字说明。纯文本模型请关掉，省 token 也避免被端点拒')),
+      DSE.t('开=图片转 base64 内联发送；关=只发「当前模型不支持图片」的文字说明。纯文本模型请关掉，省 token 也避免被端点拒')));
 
     /* ---------- 保存按钮（放在主字段下方、测试行之前：一眼可见，不用滚动） ----------
      * 这些项本来就是即改即存（输入 300ms 防抖、下拉 change 即时、失焦立即），
@@ -4000,6 +4006,11 @@ var DemoBridge = {
         if (c && c.type === 'image' && c.source && c.source.type === 'file') {
           changed = true;
           var ir = fileTexts[c.source.file_id];
+          // 纯文本模型：不白发 base64（一张图几 MB，token 白烧且多半被拒），
+          // 换成一行说明让对话能继续
+          if (!DSE.config.get('demoMultimodal')) {
+            return { type: 'text', text: '【图片：' + ((ir && ir.name) || c.source.file_id || 'image') + '，当前模型不支持图片输入，已忽略】' };
+          }
           var du = ir && ir.dataUrl;
           if (du && du.indexOf('base64,') !== -1) {
             var mt = ir.mediaType || du.slice(5, du.indexOf(';'));
