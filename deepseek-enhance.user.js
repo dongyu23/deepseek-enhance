@@ -3904,7 +3904,10 @@ DSE.modules.demoPasteTxt = DemoPasteTxt;
  * ============================================================ */
 var DemoBridge = {
   LEG_TIMEOUT: 60000,
-  LEG_TEXT_CAP: 6000,          // 喂回模型的腿报告上限（字符）
+  // 不再对腿报告设字符上限（2026-11-19 用户要求去掉）：搜索/读网页的完整内容
+  // 原样作为 tool_result 喂回模型。代价是连续搜索时上下文涨得快——工具块不像
+  // 官方端点那样被服务端清洗，会一直留在后续请求里（见模块头「本模块不做历史
+  // 清洗」）。想要上限改回来只需把下面两处 slice 恢复
   DS_LEG_BASE: 'https://api.deepseek.com/anthropic/v1',
 
   // 自定义模型起名的系统提示词（source=model）。规则式写法参照 OpenWebUI
@@ -4111,7 +4114,7 @@ var DemoBridge = {
           content_block: { type: 'web_fetch_tool_result', tool_use_id: id, kind: 'read_link',
             content: { type: 'web_fetch_result', url: q, content: { title: title }, published_at: '' } } }));
         push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i2 }));
-        toolResultText = (title ? title + '\n' : '') + String(content).slice(0, self.LEG_TEXT_CAP);
+        toolResultText = (title ? title + '\n' : '') + String(content);
       } else {
         var results = (j && j.results) || [];
         push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i1,
@@ -4471,7 +4474,7 @@ var DemoBridge = {
               push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: ridx }));
               leg = { text: '（搜索失败：' + String(le && le.message || le).slice(0, 120) + '）' };
             }
-            results.push({ type: 'tool_result', tool_use_id: tu.raw.id, content: String(leg.text || '').slice(0, self.LEG_TEXT_CAP) || '（无结果）' });
+            results.push({ type: 'tool_result', tool_use_id: tu.raw.id, content: String(leg.text || '') || '（无结果）' });
           }
           // 历史追加：assistant 原样 + user tool_result（tool_result 在前，无文本）
           messages = messages.concat([
