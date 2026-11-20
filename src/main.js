@@ -21,7 +21,6 @@
     'nav',
     'zoom',
     'buttons',
-    'demoSearch',
     'demoPasteTxt',
     'tabTitle',
     'panel'

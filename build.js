@@ -19,7 +19,6 @@ const ORDER = [
   ['modules/context.js'], ['modules/nav.js'], ['modules/zoom.js'],
   ['modules/fold.js'],
   ['modules/buttons.js'],
-  ['modules/demosearch.js'],
   ['modules/demopastetxt.js'],
   ['modules/tabtitle.js'],
   ['settings/panel.js'],

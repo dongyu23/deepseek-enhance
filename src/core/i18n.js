@@ -55,10 +55,6 @@ var I18N = {
     'LaTeX 公式渲染': 'LaTeX rendering',
     '离线 KaTeX，渲染 \\( \\)、\\[ \\]、$ 公式': 'Offline KaTeX for \\( \\), \\[ \\], $ formulas',
     '隐式时间注入': 'Implicit time injection',
-    // 会话搜索（官方主站同款文案）
-    '搜索对话内容...': 'Search conversation content...',
-    '暂无相关结果': 'No matching results',
-    '新对话': 'New chat',
     // 粘贴大段文本转 txt（官方同款文案）
     '内容已恢复到输入框': 'Content restored to the input box.',
     '本会话上下文用量': 'Session context usage',

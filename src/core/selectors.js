@@ -48,16 +48,6 @@ var SEL_DEMO = {
   aiActionBar: '.actions-_4cfe7',
   thinkBlock: '.area-_3d93a',
   thinkHeader: '.title-_3d93a',
-  // demo 页左上角与应用结构（会话搜索入口/侧边栏条目用；收起边栏按钮按
-  // aria-label 文本匹配，不依赖哈希）
-  appTop: '.top-ac14ac',
-  sidebarItem: '.item-ff6fc9',
-  // 当前会话标题在侧边栏里的标记：打开某会话后该项加上 active-ff6fc9（实测背景
-  // 变 rgb(53,54,56)、无 aria 属性可依），会话名在 .title-ff6fc9 里。注意收起
-  // 边栏时这些条目会整个从 DOM 消失，不能作为常驻数据源
-  sidebarItemActive: '.item-ff6fc9.active-ff6fc9',
-  sidebarItemTitle: '.title-ff6fc9',
-  sidebarList: '.section-ac14ac',
   // 聊天区标题：demo 页自己渲染的当前会话名（收起边栏时依然在），新对话时
   // 整个元素不存在；无标题会话显示占位"新对话"
   chatView: '.view-_5fa77',
