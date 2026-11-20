@@ -21,11 +21,8 @@
     'nav',
     'zoom',
     'buttons',
-    'demoApi',
     'demoSearch',
     'demoPasteTxt',
-    'demoBridge',
-    'ctxRing',
     'tabTitle',
     'panel'
   ];

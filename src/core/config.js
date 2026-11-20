@@ -29,15 +29,6 @@ var DEFAULT_CONFIG = {
   latexRender: true,                     // KaTeX 公式渲染（官网默认不渲染 \( \)/\[ \]/$...$）
   timeInject: false,                     // 时间注入
   ctxWarnPct: 80,                        // 上下文用量提醒阈值（百分比，达阈值弹提示）
-  demoCustom: false,                      // chat-demo 页自定义模型总开关：关=完全官方逻辑（DeepSeek 模型/端点/搜索，脚本零干预）
-  demoEndpoint: '',                      // chat-demo 页 API 端点覆盖（空=官方 api.deepseek.com/anthropic/v1；不含 /messages）
-  demoKey: '',                           // chat-demo 页 API Key 覆盖（空=用页面里填的官方 Key）
-  demoModel: '',                         // chat-demo 页模型覆盖（空=用官方默认 deepseek-flash）
-  demoMultimodal: true,                  // 自定义模型是否支持图片：开=图片转 base64 内联发出；关=换成文字说明（纯文本模型开着也是白搭 token）
-  demoCtxLimit: 128000,                   // 自定义模型的上下文窗口（tokens，用于占用环百分比；按所用模型自行调整）
-  demoToolMode: 'native',                // 自定义端点时的工具调用方式：native=DeepSeek 模型在对话中驱动搜索（含模型 token 费）/ searchapi=直调独立搜索 API（仅付 $0.75/1000 次）
-  demoBridge: 'auto',                   // 第三方端点时的工具桥接：auto(端点非 deepseek 即启用) / on / off
-  demoTitleSource: 'deepseek',          // 第三方端点时的会话标题来源：deepseek=起名腿打 DeepSeek 官方端点（title 参数，约 $0.001/次）/ model=当前自定义模型按提示词起名（费用走第三方）/ off=不起名，用首条消息截断
 
   // 单会话系统提示词（独立开关，按会话隔离）
   systemPromptEnabled: false,
@@ -61,13 +52,7 @@ var Config = {
     if (this._cache) return this._cache;
     var saved = Bridge.get(CFG_KEY, null);
     var cfg = cloneDefaults();
-    if (saved && typeof saved === 'object') {
-      this._merge(cfg, saved);
-      // 旧配置迁移：demoAutoTitle（布尔开关）→ demoTitleSource（三选一）。
-      // _merge 只合并在 defaults 里存在的键，旧键会被静默丢弃——不在这里显式
-      // 映射的话，"关过起名"的用户升级后会被默认值重新打开
-      if (saved.demoAutoTitle === false && !('demoTitleSource' in saved)) cfg.demoTitleSource = 'off';
-    }
+    if (saved && typeof saved === 'object') this._merge(cfg, saved);
     this._cache = cfg;
     return cfg;
   },

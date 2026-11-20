@@ -19,11 +19,8 @@ const ORDER = [
   ['modules/context.js'], ['modules/nav.js'], ['modules/zoom.js'],
   ['modules/fold.js'],
   ['modules/buttons.js'],
-  ['modules/demoapi.js'],
   ['modules/demosearch.js'],
   ['modules/demopastetxt.js'],
-  ['modules/demobridge.js'],
-  ['modules/ctxring.js'],
   ['modules/tabtitle.js'],
   ['settings/panel.js'],
   ['main.js'], ['footer.js']
@@ -36,14 +33,6 @@ let body = vendorBody + '\n' + ORDER.map((f) => '\n/* ===== ' + f + ' ===== */\n
 // 版本号单一来源：把 header 的 @version 同步进运行时常量，避免两处不一致
 const _ver = (header.match(/@version\s+([\d.]+)/) || [])[1] || '0.0.0';
 body = body.replace(/version: '[^']*'/, "version: '" + _ver + "'");
-// 资源内联：源码里的 __DSE_XXX__ 占位符替换成 src/assets 下对应文件内容
-// （如官方标识 SVG——只存在于主站 bundle、没有静态 URL，只能随脚本分发）
-const ASSETS = { '__DSE_LOGO_SVG__': 'assets/official-logo.svg' };
-Object.keys(ASSETS).forEach((k) => {
-  const asset = read(ASSETS[k]).trim();
-  if (!body.includes(k)) throw new Error('asset placeholder not found: ' + k);
-  body = body.split(k).join(asset);
-});
 
 const userJs = header + '\n' + body + '\n';
 const meta = header.split('\n').filter((l) => l.startsWith('// ==UserScript==') ||

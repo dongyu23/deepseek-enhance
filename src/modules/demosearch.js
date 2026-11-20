@@ -95,7 +95,7 @@ var DemoSearch = {
       'transition:background .15s;opacity:.9';
     btn.innerHTML = this.ICON_MAGNIFIER;
     // 注意：事件处理器是普通函数，里面的 this 是按钮元素而非模块——必须用
-    // 顶部捕获的 self（本模块已在 demobridge 的 IIFE 上踩过同款坑）
+    // 顶部捕获的 self（同类坑在别的模块也踩过）
     btn.addEventListener('mouseenter', function () { btn.style.background = self.pal().hover; });
     btn.addEventListener('mouseleave', function () { btn.style.background = 'transparent'; });
     btn.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); self.open(); });
